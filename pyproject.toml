@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optiqs"
+version = "0.1.0"
+dependencies = ["numpy", "scipy", "sparse"]
+
+[tool.setuptools.package-dir]
+optiqs = "optiqs"
+
+[project.optional-dependencies]
+dev = ["mypy", "scipy-stubs", "pytest"]
+gpu = ["cupy-cuda12x"]
+gpu-cuda11 = ["cupy-cuda11x"]
+gpu-cuda12 = ["cupy-cuda12x"]
