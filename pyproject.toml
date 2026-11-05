@@ -11,7 +11,5 @@ dependencies = ["numpy", "scipy"]
 optiqs = "optiqs"
 
 [project.optional-dependencies]
-dev = ["mypy", "scipy-stubs", "pytest"]
-gpu = ["cupy-cuda12x"]
-gpu-cuda11 = ["cupy-cuda11x"]
-gpu-cuda12 = ["cupy-cuda12x"]
+gpu = ["torch"]
+dev = ["mypy", "scipy-stubs", "pytest", "torch"]
