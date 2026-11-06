@@ -3,8 +3,7 @@ from optiqs.operators.beam_splitter import beam_splitter, bs
 from optiqs.operators.identity import identity
 from optiqs.operators.number import num
 from optiqs.operators.phase_shift import phase_shift, rot
-
-# from optiqs.operators.squeeze import squeeze
+from optiqs.operators.squeeze import sq, squeeze
 
 __all__ = [
     "annihilation",
@@ -14,5 +13,6 @@ __all__ = [
     "num",
     "phase_shift",
     "rot",
-    # "squeeze",
+    "sq",
+    "squeeze",
 ]
