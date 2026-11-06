@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 import numpy as np
 from scipy import sparse
@@ -14,45 +14,77 @@ if TYPE_CHECKING:
     import torch
 
 
-def _is_torch(data: object) -> bool:
-    return not isinstance(data, (np.ndarray, sparse.sparray))
-
-
 def _scalar(data: object) -> complex:
     """Extract a scalar from a 1x1 dense/sparse product or a tensor."""
-    if sparse.issparse(data):
+    if isinstance(data, (sparse.csr_array, sparse.csc_array)):
         return complex(data[0, 0])
-    if hasattr(data, "item"):
+    if isinstance(data, (np.ndarray, np.generic)):
         return complex(data.item())
-    return complex(data)
+    if isinstance(data, (int, float, complex)):
+        return complex(data)
+    import torch
+
+    if isinstance(data, torch.Tensor):
+        return complex(data.item())
+    raise TypeError(f"Expected scalar data, received {type(data)}")
 
 
-def _ket(data: np.ndarray | sparse.sparray | torch.Tensor, qtype: Qtype):
-    """Return a ket view; a bra is conjugate-transposed, not copied to dense."""
-    return data if qtype == Qtype.ket else data.conj().T
+def _ket(
+    data: np.ndarray | sparse.csr_array | torch.Tensor, qtype: Qtype
+) -> np.ndarray | sparse.csr_array | torch.Tensor:
+    """Return a ket; sparse bra transposes are converted to CSR, never dense."""
+    if qtype == Qtype.ket:
+        return data
+    if isinstance(data, sparse.csr_array):
+        return sparse.csr_array(data.conj().T)
+    return data.conj().T
 
 
-def _inner(left, right) -> complex:
+def _inner(
+    left: np.ndarray | sparse.csr_array | torch.Tensor,
+    right: np.ndarray | sparse.csr_array | torch.Tensor,
+) -> complex:
     """Compute <left|right>, keeping sparse vectors sparse."""
-    if _is_torch(left):
-        import torch
-
-        return complex(torch.vdot(left.reshape(-1), right.reshape(-1)).item())
     if isinstance(left, np.ndarray) and isinstance(right, np.ndarray):
         return complex(np.vdot(left, right))
-    if sparse.issparse(left):
+    if isinstance(left, sparse.csr_array) and isinstance(
+        right, (np.ndarray, sparse.csr_array)
+    ):
         return _scalar(left.conj().T @ right)
-    # NumPy's matmul with a SciPy sparse array is backend/version dependent.
-    return _scalar(right.conj().T @ left).conjugate()
+    if isinstance(left, np.ndarray) and isinstance(right, sparse.csr_array):
+        # NumPy @ SciPy sparse is backend/version dependent.
+        return _scalar(right.conj().T @ left).conjugate()
+    import torch
+
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        return complex(torch.vdot(left.reshape(-1), right.reshape(-1)).item())
+    raise TypeError("Cannot mix NumPy/SciPy and PyTorch states")
 
 
-def _expectation(state, operator) -> complex:
+def _expectation(
+    state: np.ndarray | sparse.csr_array | torch.Tensor,
+    operator: np.ndarray | sparse.csr_array | torch.Tensor,
+) -> complex:
     """Compute <psi|rho|psi>, never constructing |psi><psi|."""
-    if isinstance(operator, np.ndarray) and sparse.issparse(state):
+    if isinstance(operator, np.ndarray) and isinstance(state, sparse.csr_array):
         # Only a length-d vector is densified; the d-by-d operator is already
         # dense. NumPy @ sparse is not reliable across NumPy/SciPy versions.
         state = state.toarray()
-    return _inner(state, operator @ state)
+    if isinstance(operator, (np.ndarray, sparse.csr_array)) and isinstance(
+        state, (np.ndarray, sparse.csr_array)
+    ):
+        product = operator @ state
+        if isinstance(product, np.ndarray):
+            return _inner(state, product)
+        if isinstance(product, sparse.csr_array):
+            # CSR @ CSR returns CSR; reuse it without densifying or rewrapping.
+            return _inner(state, product)
+        raise TypeError("Unexpected NumPy/SciPy matrix-product result")
+    import torch
+
+    if isinstance(operator, torch.Tensor) and isinstance(state, torch.Tensor):
+        return _inner(state, operator @ state)
+    raise TypeError("Cannot mix NumPy/SciPy and PyTorch states")
 
 
 def _positive_real(value: complex, name: str) -> float:
@@ -66,8 +98,8 @@ def _positive_real(value: complex, name: str) -> float:
     return float(value.real)
 
 
-def _finite(data) -> bool:
-    if sparse.issparse(data):
+def _finite(data: np.ndarray | sparse.csr_array | torch.Tensor) -> bool:
+    if isinstance(data, sparse.csr_array):
         return bool(np.isfinite(data.data).all())
     if isinstance(data, np.ndarray):
         return bool(np.isfinite(data).all())
@@ -76,9 +108,9 @@ def _finite(data) -> bool:
     return bool(torch.isfinite(data).all().item())
 
 
-def _hermitian(data) -> bool:
+def _hermitian(data: np.ndarray | sparse.csr_array | torch.Tensor) -> bool:
     """Check Hermiticity without densifying a sparse operator."""
-    if sparse.issparse(data):
+    if isinstance(data, sparse.csr_array):
         skew = data - data.conj().T
         if skew.nnz == 0:
             return True
@@ -92,9 +124,21 @@ def _hermitian(data) -> bool:
     return bool(torch.allclose(data, data.conj().T, rtol=tol, atol=tol))
 
 
-def _diagonal_if_diagonal(data):
+@overload
+def _diagonal_if_diagonal(
+    data: np.ndarray | sparse.csr_array,
+) -> np.ndarray | None: ...
+
+
+@overload
+def _diagonal_if_diagonal(data: torch.Tensor) -> torch.Tensor | None: ...
+
+
+def _diagonal_if_diagonal(
+    data: np.ndarray | sparse.csr_array | torch.Tensor,
+) -> np.ndarray | torch.Tensor | None:
     """Return a diagonal view/array if all off-diagonal entries vanish."""
-    if sparse.issparse(data):
+    if isinstance(data, sparse.csr_array):
         entries = data.tocoo()
         if np.any(entries.row != entries.col):
             return None
@@ -104,34 +148,47 @@ def _diagonal_if_diagonal(data):
         return diag if np.count_nonzero(data) == np.count_nonzero(diag) else None
     import torch
 
-    diag = torch.diagonal(data)
-    if torch.count_nonzero(data).item() == torch.count_nonzero(diag).item():
-        return diag
+    torch_diag = torch.diagonal(data)
+    if torch.count_nonzero(data).item() == torch.count_nonzero(torch_diag).item():
+        return torch_diag
     return None
 
 
-def _nonnegative_eigenvalues(values, name: str):
+@overload
+def _nonnegative_eigenvalues(values: np.ndarray, name: str) -> np.ndarray: ...
+
+
+@overload
+def _nonnegative_eigenvalues(values: torch.Tensor, name: str) -> torch.Tensor: ...
+
+
+def _nonnegative_eigenvalues(
+    values: np.ndarray | torch.Tensor, name: str
+) -> np.ndarray | torch.Tensor:
     """Clip eigensolver roundoff, rejecting significantly negative values."""
     if isinstance(values, np.ndarray):
         if not np.isfinite(values).all():
             raise ValueError(f"{name} has non-finite eigenvalues")
         if np.iscomplexobj(values):
-            if np.any(np.abs(values.imag) > 1e-10):
+            if np.any(np.abs(np.imag(values)) > 1e-10):
                 raise ValueError(f"{name} has non-real eigenvalues")
-            values = values.real
-        values = np.asarray(
-            values, dtype=np.float64 if values.dtype.kind not in "f" else None
-        )
-        eps = np.finfo(values.dtype).eps
+            values = np.real(values)
+        # Preserve float32/float64 precision, but cast integer inputs to float.
+        # NumPy functions narrow reliably in both Pyright and mypy.
+        if np.issubdtype(values.dtype, np.floating):
+            real_values = np.asarray(values)
+        else:
+            real_values = np.asarray(values, dtype=np.float64)
+        eps = np.finfo(real_values.dtype).eps
         scale = max(
-            float(np.max(np.abs(values), initial=0.0)),
-            np.finfo(values.dtype).tiny,
+            float(np.max(np.abs(real_values), initial=0.0)),
+            np.finfo(real_values.dtype).tiny,
         )
         threshold = 32 * eps * scale
-        if np.any(values < -threshold):
+        if np.any(real_values < -threshold):
             raise ValueError(f"{name} must be positive semidefinite")
         # Tiny positive eigenvalues from eigensolver noise are also dropped.
-        return np.where(values > threshold, values, 0.0)
+        return np.where(real_values > threshold, real_values, 0.0)
 
     import torch
 
@@ -151,48 +208,61 @@ def _nonnegative_eigenvalues(values, name: str):
     return torch.where(values > threshold, values, torch.zeros_like(values))
 
 
-def _is_rank_one_density(data, trace: float) -> bool:
+def _is_rank_one_density(
+    data: np.ndarray | sparse.csr_array | torch.Tensor, trace: float
+) -> bool:
     """For positive Hermitian rho, tr(rho**2) == tr(rho)**2 iff rank 1.
 
     This check reads only existing entries: O(nnz) for sparse matrices.
     """
-    if sparse.issparse(data):
+    if isinstance(data, sparse.csr_array):
         purity = float(np.vdot(data.data, data.data).real)
-        eps = np.finfo(
-            np.float32 if data.dtype in (np.float32, np.complex64) else np.float64
-        ).eps
+        eps = float(
+            np.finfo(
+                np.float32 if data.dtype in (np.float32, np.complex64) else np.float64
+            ).eps
+        )
     elif isinstance(data, np.ndarray):
         purity = float(np.vdot(data, data).real)
-        eps = np.finfo(
-            np.float32 if data.dtype in (np.float32, np.complex64) else np.float64
-        ).eps
+        eps = float(
+            np.finfo(
+                np.float32 if data.dtype in (np.float32, np.complex64) else np.float64
+            ).eps
+        )
     else:
         import torch
 
         purity = float(torch.vdot(data.reshape(-1), data.reshape(-1)).real.item())
-        eps = torch.finfo(data.real.dtype).eps
+        eps = float(torch.finfo(data.real.dtype).eps)
     target = trace * trace
     return abs(purity - target) <= 32 * eps * max(abs(purity), abs(target))
 
 
-def _trace_product(first, second) -> complex:
+def _trace_product(
+    first: np.ndarray | sparse.csr_array | torch.Tensor,
+    second: np.ndarray | sparse.csr_array | torch.Tensor,
+) -> complex:
     """Compute Tr(first @ second) in O(nnz) for sparse operators."""
-    if sparse.issparse(first) and sparse.issparse(second):
+    if isinstance(first, sparse.csr_array) and isinstance(second, sparse.csr_array):
         return complex(first.multiply(second.T).sum())
-    if sparse.issparse(first):
+    if isinstance(first, sparse.csr_array) and isinstance(second, np.ndarray):
         entries = first.tocoo()
         return complex(np.sum(entries.data * second[entries.col, entries.row]))
-    if sparse.issparse(second):
+    if isinstance(second, sparse.csr_array) and isinstance(first, np.ndarray):
         entries = second.tocoo()
         return complex(np.sum(entries.data * first[entries.col, entries.row]))
-    if isinstance(first, np.ndarray):
+    if isinstance(first, np.ndarray) and isinstance(second, np.ndarray):
         return complex(np.einsum("ij,ji->", first, second))
     import torch
 
-    return complex(torch.sum(first * second.T).item())
+    if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
+        return complex(torch.sum(first * second.T).item())
+    raise TypeError("Cannot mix NumPy/SciPy and PyTorch states")
 
 
-def _root_fidelity_numpy(first, second) -> float:
+def _root_fidelity_numpy(
+    first: np.ndarray | sparse.csr_array, second: np.ndarray | sparse.csr_array
+) -> float:
     """Tr sqrt(sqrt(first) @ second @ sqrt(first)) on NumPy/SciPy."""
     first_diag = _diagonal_if_diagonal(first)
     second_diag = _diagonal_if_diagonal(second)
@@ -211,14 +281,14 @@ def _root_fidelity_numpy(first, second) -> float:
         # The eigenvectors of a diagonal density matrix are the basis vectors.
         # Skip its eigendecomposition; only one Hermitian eigensolve is needed.
         roots = np.sqrt(_nonnegative_eigenvalues(first_diag, "density operator"))
-        other = second.toarray() if sparse.issparse(second) else second
+        other = second.toarray() if isinstance(second, sparse.csr_array) else second
         sandwich = (roots[:, None] * other) * roots[None, :]
     else:
-        if sparse.issparse(first) and isinstance(second, np.ndarray):
+        if isinstance(first, sparse.csr_array) and isinstance(second, np.ndarray):
             # Diagonalize the matrix already stored dense, instead of
             # unnecessarily densifying the other operand.
             first, second = second, first
-        dense = first.toarray() if sparse.issparse(first) else first
+        dense = first.toarray() if isinstance(first, sparse.csr_array) else first
         eigenvalues, eigenvectors = np.linalg.eigh(dense)
         eigenvalues = _nonnegative_eigenvalues(eigenvalues, "density operator")
         active = eigenvalues > 0
@@ -235,7 +305,7 @@ def _root_fidelity_numpy(first, second) -> float:
     return float(np.sqrt(spectrum).sum())
 
 
-def _root_fidelity_torch(first, second) -> float:
+def _root_fidelity_torch(first: torch.Tensor, second: torch.Tensor) -> float:
     """Same spectral calculation, entirely on the original torch device."""
     import torch
 
@@ -321,11 +391,15 @@ def fidelity(first: Qobj, second: Qobj, *, squared: bool = True) -> float:
         raise ValueError("fidelity() requires matching Hilbert-space dimensions")
 
     a, b = first._data, second._data
-    if _is_torch(a) != _is_torch(b):
+    numpy_a = isinstance(a, (np.ndarray, sparse.csr_array))
+    numpy_b = isinstance(b, (np.ndarray, sparse.csr_array))
+    if numpy_a != numpy_b:
         raise TypeError("Cannot mix PyTorch and NumPy/SciPy states")
-    if _is_torch(a):
+    if not numpy_a:
         import torch
 
+        if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+            raise TypeError("Unsupported Qobj data type")
         if a.device != b.device:
             raise ValueError("PyTorch states must be on the same device")
         dtype = torch.promote_types(a.dtype, b.dtype)
@@ -376,9 +450,16 @@ def fidelity(first: Qobj, second: Qobj, *, squared: bool = True) -> float:
             raise ValueError("Density-operator overlap must be real")
         result = overlap.real / (norm_a * norm_b)
     else:
-        root = (
-            _root_fidelity_torch(a, b) if _is_torch(a) else _root_fidelity_numpy(a, b)
-        )
+        if isinstance(a, (np.ndarray, sparse.csr_array)) and isinstance(
+            b, (np.ndarray, sparse.csr_array)
+        ):
+            root = _root_fidelity_numpy(a, b)
+        else:
+            import torch
+
+            if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+                raise TypeError("Unsupported Qobj data type")
+            root = _root_fidelity_torch(a, b)
         result = root**2 / (norm_a * norm_b)
 
     if not math.isfinite(result):
