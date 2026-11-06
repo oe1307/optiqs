@@ -33,8 +33,9 @@ def rotational_cat(
     alpha : complex
         Coherent-state amplitude (must be finite).
     order : int
-        Rotational symmetry order M (number of coherent-state components).
-        Must be an integer >= 2.
+        Rotational symmetry order M.
+        Must be an integer >= 1.
+        For order=1, the state reduces to a coherent state.
     sector : int, optional
         Rotation-eigenvalue sector s in [0, order). The resulting ket is
         an eigenstate of exp(2*pi*i*n_hat/order) with eigenvalue
@@ -82,8 +83,8 @@ def rotational_cat(
 
     if dim < 1:
         raise ValueError("dim must be positive")
-    if order < 2:
-        raise ValueError("order must be at least 2")
+    if order < 1:
+        raise ValueError("order must be at least 1")
     if not 0 <= sector < order:
         raise ValueError("sector must satisfy 0 <= sector < order")
     if sector >= dim:
