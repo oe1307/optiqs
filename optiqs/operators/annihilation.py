@@ -44,3 +44,6 @@ def annihilation(
         dims=((dim,), (dim,)),
         qtype=Qtype.oper,
     )
+
+
+destroy = annihilation
