@@ -14,7 +14,17 @@ from optiqs.operators import (
     squeeze,
 )
 from optiqs.projectors import wigner
-from optiqs.states import cat, coherent, fock, gkp, rotational_cat, rs_cat, vacuum
+from optiqs.states import (
+    cat,
+    coherent,
+    fock,
+    gkp,
+    rotational_binomial,
+    rotational_cat,
+    rs_binomial,
+    rs_cat,
+    vacuum,
+)
 from optiqs.utils import _to_numpy_dtype, get_device
 
 __all__ = [
@@ -43,7 +53,9 @@ __all__ = [
     "coherent",
     "fock",
     "gkp",
+    "rotational_binomial",
     "rotational_cat",
+    "rs_binomial",
     "rs_cat",
     "vacuum",
     # === utils ===
