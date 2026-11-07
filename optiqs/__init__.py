@@ -1,3 +1,4 @@
+from optiqs.channels import photon_loss
 from optiqs.core import Expm, Qobj, fidelity, load_state, save_state, tensor
 from optiqs.measurements import (
     homodyne_probabilities,
@@ -55,6 +56,7 @@ __all__ = [
     "num",
     "number",
     "phase_shift",
+    "photon_loss",
     "photon_number_probabilities",
     "qeye",
     "rot",
