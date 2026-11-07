@@ -41,12 +41,7 @@ def identity(
     values = np.asarray(np.ones(dim, dtype=np.float64), dtype=dtype)
     data = diags_array(values, offsets=0, shape=(dim, dim), format="csr")
 
-    return Qobj(
-        data,
-        dims=((dim,), (dim,)),
-        qtype=Qtype.oper,
-        tol=tol,
-    )
+    return Qobj(data, dims=((dim,), (dim,)), qtype=Qtype.oper, tol=tol)
 
 
 qeye = identity

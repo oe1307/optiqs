@@ -19,9 +19,7 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def _to_numpy_dtype(
-    dtype: DTypeLike | torch.dtype | None,
-) -> np.dtype[Any] | None:
+def _to_numpy_dtype(dtype: DTypeLike | torch.dtype | None) -> np.dtype[Any] | None:
     if dtype is None:
         return None
     try:

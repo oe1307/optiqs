@@ -14,7 +14,7 @@
 
 ## Setup
 
-```
+```sh
 pip install git+https://github.com/oe1307/optiqs.git
 ```
 

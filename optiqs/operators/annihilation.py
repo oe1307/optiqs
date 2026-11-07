@@ -39,11 +39,7 @@ def annihilation(
         format="csr",
         dtype=np.complex128,
     )
-    return Qobj(
-        matrix,
-        dims=((dim,), (dim,)),
-        qtype=Qtype.oper,
-    )
+    return Qobj(matrix, dims=((dim,), (dim,)), qtype=Qtype.oper)
 
 
 destroy = annihilation

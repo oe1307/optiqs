@@ -105,12 +105,7 @@ def phase_shift(
         shape=(dim, dim),
         format="csr",
     )
-    return Qobj(
-        matrix,
-        dims=((dim,), (dim,)),
-        qtype=Qtype.oper,
-        tol=tol,
-    )
+    return Qobj(matrix, dims=((dim,), (dim,)), qtype=Qtype.oper, tol=tol)
 
 
 rot = phase_shift
