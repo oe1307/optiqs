@@ -4,6 +4,7 @@ import math
 from collections.abc import Sequence
 from enum import StrEnum
 from numbers import Number
+from os import PathLike
 from types import NotImplementedType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -144,6 +145,12 @@ class Qobj:
             raise TypeError(f"Unsupported data type: {type(data)}")
 
         return data.detach().cpu().resolve_conj().resolve_neg().numpy().copy()
+
+    def save(self, filename: str | PathLike[str]) -> None:
+        """Save this quantum object; see :func:`optiqs.save_state`."""
+        from optiqs.core.io import save_state
+
+        save_state(self, filename)
 
     def __eq__(self, other: object) -> bool | NotImplementedType:
         """Compare Qobj values with an absolute tolerance, ignoring backend/dtype.

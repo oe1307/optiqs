@@ -1,4 +1,4 @@
-from optiqs.core import Expm, Qobj, fidelity, tensor
+from optiqs.core import Expm, Qobj, fidelity, load_state, save_state, tensor
 from optiqs.operators import (
     annihilation,
     beam_splitter,
@@ -30,8 +30,10 @@ from optiqs.utils import _to_numpy_dtype, get_device
 __all__ = [
     # === core ===
     "Expm",
-    "fidelity",
     "Qobj",
+    "fidelity",
+    "load_state",
+    "save_state",
     "tensor",
     # === operators ===
     "annihilation",
