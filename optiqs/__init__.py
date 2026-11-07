@@ -5,6 +5,8 @@ from optiqs.measurements import (
     measure_homodyne,
     measure_photon_number,
     photon_number_probabilities,
+    post_select,
+    postselect_photon_number,
 )
 from optiqs.operators import (
     annihilation,
@@ -58,6 +60,8 @@ __all__ = [
     "phase_shift",
     "photon_loss",
     "photon_number_probabilities",
+    "post_select",
+    "postselect_photon_number",
     "qeye",
     "rot",
     "rotational_binomial",
