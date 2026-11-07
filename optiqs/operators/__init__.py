@@ -7,14 +7,14 @@ from optiqs.operators.squeeze import sq, squeeze
 
 __all__ = [
     "annihilation",
-    "destroy",
     "beam_splitter",
     "bs",
+    "destroy",
     "identity",
-    "qeye",
     "num",
     "number",
     "phase_shift",
+    "qeye",
     "rot",
     "sq",
     "squeeze",

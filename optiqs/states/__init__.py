@@ -9,10 +9,10 @@ __all__ = [
     "cat",
     "coherent",
     "fock",
-    "vacuum",
     "gkp",
     "rotational_binomial",
-    "rs_binomial",
     "rotational_cat",
+    "rs_binomial",
     "rs_cat",
+    "vacuum",
 ]

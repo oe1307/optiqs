@@ -8,9 +8,10 @@ this is particularly useful for large, sparse beam-splitter generators.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from numbers import Number
 from types import NotImplementedType
-from typing import Any, Callable, TypeAlias, cast
+from typing import Any, TypeAlias, cast
 
 import numpy as np
 from scipy import sparse
@@ -62,9 +63,7 @@ class Expm:
     quadratic memory.  PyTorch-backed objects are not supported.
     """
 
-    def __init__(
-        self, generator: Qobj, scale: float | complex | np.number[Any] = 1.0
-    ) -> None:
+    def __init__(self, generator: Qobj, scale: complex | np.number[Any] = 1.0) -> None:
         if not isinstance(generator, Qobj):
             raise TypeError("generator must be a Qobj")
         if generator.qtype != Qtype.oper or generator.dims[0] != generator.dims[1]:

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
-import scipy.sparse as sparse
+from scipy import sparse
 
 from optiqs.core.q_obj import Qobj, Qtype
 

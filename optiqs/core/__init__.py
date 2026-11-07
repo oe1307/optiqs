@@ -6,9 +6,9 @@ from optiqs.core.tensor import tensor
 
 __all__ = [
     "Expm",
+    "Qobj",
     "fidelity",
     "load_state",
     "save_state",
-    "Qobj",
     "tensor",
 ]

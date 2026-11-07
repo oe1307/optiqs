@@ -78,7 +78,7 @@ def rotational_binomial(
         if isinstance(value, (bool, np.bool_)) or not isinstance(
             value, (int, np.integer)
         ):
-            raise ValueError(f"{name} must be an integer")
+            raise TypeError(f"{name} must be an integer")
 
     if dim < 1:
         raise ValueError("dim must be positive")

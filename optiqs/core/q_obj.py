@@ -53,7 +53,7 @@ class Qobj:
             elif tol > 1:
                 _data.data[np.abs(_data.data.astype(np.float64)) < tol] = 0
             _data.eliminate_zeros()
-        elif isinstance(data, np.ndarray) or isinstance(data, list):
+        elif isinstance(data, (np.ndarray, list)):
             np_dtype = _to_numpy_dtype(dtype)
             _data = np.array(data, dtype=np_dtype)
         else:
@@ -522,9 +522,7 @@ class Qobj:
             qtype = Qtype.ket
         elif result.shape[0] == 1 and other.qtype == Qtype.bra:
             qtype = Qtype.bra
-        elif result.shape[1] == 1 and self.qtype == Qtype.ket:
-            qtype = Qtype.ket
-        elif result.shape[1] == 1:
+        elif result.shape[1] == 1 and self.qtype == Qtype.ket or result.shape[1] == 1:
             qtype = Qtype.ket
         elif result.shape[0] == 1:
             qtype = Qtype.bra
@@ -561,7 +559,7 @@ class Qobj:
             tol=self._tol,
         )
 
-    def unit(self) -> "Qobj":
+    def unit(self) -> Qobj:
         """
         Return a trace-one density operator from a ket or bra.
 
@@ -668,7 +666,7 @@ class Qobj:
 
         return Qobj(self._data.clone(), dims=self.dims, tol=self._tol, qtype=self.qtype)
 
-    def dag(self) -> "Qobj":
+    def dag(self) -> Qobj:
         """Hermitian conjugate of the state"""
         adjoint_type = {
             Qtype.ket: Qtype.bra,
@@ -682,7 +680,7 @@ class Qobj:
             qtype=adjoint_type,
         )
 
-    def dm(self) -> "Qobj":
+    def dm(self) -> Qobj:
         """Convert a pure quantum state into a density operator."""
         if not self.is_vector():
             raise TypeError("Density operator conversion requires a ket or bra")
