@@ -1,5 +1,10 @@
 from optiqs.core import Expm, Qobj, fidelity, load_state, save_state, tensor
-from optiqs.measurements import measure_photon_number, photon_number_probabilities
+from optiqs.measurements import (
+    homodyne_probabilities,
+    measure_homodyne,
+    measure_photon_number,
+    photon_number_probabilities,
+)
 from optiqs.operators import (
     annihilation,
     beam_splitter,
@@ -37,6 +42,8 @@ __all__ = [
     "save_state",
     "tensor",
     # === measurements ===
+    "homodyne_probabilities",
+    "measure_homodyne",
     "measure_photon_number",
     "photon_number_probabilities",
     # === operators ===
