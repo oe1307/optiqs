@@ -60,10 +60,7 @@ def fock(
     if not 0 <= n < dim:
         raise ValueError("n must satisfy 0 <= n < dim")
 
-    data = csr_array(
-        ([1.0 + 0j], ([n], [0])),
-        shape=(dim, 1),
-    )
+    data = csr_array(([1.0 + 0j], ([n], [0])), shape=(dim, 1))
     return Qobj(data, dtype=dtype, tol=tol)
 
 

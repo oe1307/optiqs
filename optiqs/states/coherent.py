@@ -77,8 +77,5 @@ def coherent(
         coeff = np.exp(log_amp - log_amp.max() + 1j * n * np.angle(alpha))
         coeff /= np.linalg.norm(coeff)
 
-    data = csr_array(
-        (coeff, (n, np.zeros(n.size, dtype=int))),
-        shape=(dim, 1),
-    )
+    data = csr_array((coeff, (n, np.zeros(n.size, dtype=int))), shape=(dim, 1))
     return Qobj(data, dtype=dtype, tol=tol)

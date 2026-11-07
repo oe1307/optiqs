@@ -19,7 +19,7 @@ from optiqs.operators import (
     sq,
     squeeze,
 )
-from optiqs.projectors import wigner
+from optiqs.phase_space import wigner
 from optiqs.states import (
     cat,
     coherent,
@@ -59,7 +59,7 @@ __all__ = [
     "rot",
     "sq",
     "squeeze",
-    # === projector ===
+    # === phase_space ===
     "wigner",
     # === states ===
     "cat",
