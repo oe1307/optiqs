@@ -17,6 +17,7 @@ from scipy.sparse import csr_array
 from optiqs.core.q_obj import Qobj, Qtype
 
 if TYPE_CHECKING:
+    import numpy.typing as npt
     import torch
 
 
@@ -38,7 +39,8 @@ def _geometry(state: Qobj, mode: int) -> tuple[int, int]:
     dims = state.dims[1] if state.qtype == Qtype.bra else state.dims[0]
     if not 0 <= mode < len(dims):
         raise IndexError("mode is outside the available subsystems")
-    return dims[mode], prod(dims[mode + 1 :])
+    next_mode = mode + 1
+    return dims[mode], prod(dims[next_mode:])
 
 
 def _squared_magnitudes_numpy(values: np.ndarray) -> np.ndarray:
@@ -52,7 +54,7 @@ def _squared_magnitudes_numpy(values: np.ndarray) -> np.ndarray:
     return np.square(values, dtype=np.float64)
 
 
-def _checked_diagonal_numpy(diagonal: np.ndarray) -> np.ndarray:
+def _checked_diagonal_numpy(diagonal: npt.NDArray[np.generic]) -> np.ndarray:
     """Validate density diagonals with minimal temporary arrays/reductions.
 
     Finite min/max are sufficient for real data.  For complex data, the
@@ -74,14 +76,8 @@ def _checked_diagonal_numpy(diagonal: np.ndarray) -> np.ndarray:
         maximum = real.max(initial=0)
         if not np.isfinite(minimum) or not np.isfinite(maximum):
             raise ValueError("density-operator diagonal must be finite")
-        eps = (
-            np.finfo(real.dtype).eps
-            if diagonal.dtype.kind == "f"
-            else 0.0
-        )
-        tolerance = _DIAGONAL_ULPS * eps * max(
-            abs(float(minimum)), abs(float(maximum))
-        )
+        eps = np.finfo(real.dtype).eps if diagonal.dtype.kind == "f" else 0.0
+        tolerance = _DIAGONAL_ULPS * eps * max(abs(float(minimum)), abs(float(maximum)))
     if minimum < -tolerance:
         raise ValueError("density-operator diagonal must be nonnegative")
     # Clamp tolerated tiny negative values without modifying the source.
@@ -136,8 +132,12 @@ def _torch_vector_weights(data: torch.Tensor, dim: int, stride: int) -> np.ndarr
         promoted = data.to(torch.complex128 if data.is_complex() else torch.float64)
         result = (
             promoted.reshape(-1, dim, stride)
-            .abs().square().sum(dim=(0, 2))
-            .detach().to(device="cpu", dtype=torch.float64).numpy()
+            .abs()
+            .square()
+            .sum(dim=(0, 2))
+            .detach()
+            .to(device="cpu", dtype=torch.float64)
+            .numpy()
         )
     return result
 
@@ -155,8 +155,7 @@ def _csr_ket_rows(data: csr_array) -> np.ndarray:
         # CSR indptr is sorted.  side='right' returns the row containing the
         # k-th stored entry even when several successive rows are empty.
         return np.searchsorted(
-            data.indptr[1:], np.arange(data.nnz, dtype=data.indptr.dtype),
-            side="right",
+            data.indptr[1:], np.arange(data.nnz, dtype=data.indptr.dtype), side="right"
         )
     if data.nnz >= data.shape[0] // 8:
         return np.flatnonzero(data.indptr[1:] != data.indptr[:-1])
@@ -175,9 +174,7 @@ def _raw_weights(
             # converting every entry to COO and filtering them in Python.
             # This allocates O(D) diagonal data, never a dense D x D state.
             diagonal = _checked_diagonal_numpy(np.asarray(data.diagonal()))
-            return diagonal.reshape(-1, dim, stride).sum(
-                axis=(0, 2), dtype=np.float64
-            )
+            return diagonal.reshape(-1, dim, stride).sum(axis=(0, 2), dtype=np.float64)
         if state.qtype == Qtype.ket:
             indices, values = _csr_ket_rows(data), data.data
             if sparse_ket_rows is not None:
@@ -205,9 +202,7 @@ def _raw_weights(
     if isinstance(data, np.ndarray):
         if state.qtype == Qtype.oper:
             diagonal = _checked_diagonal_numpy(np.diagonal(data))
-            return diagonal.reshape(-1, dim, stride).sum(
-                axis=(0, 2), dtype=np.float64
-            )
+            return diagonal.reshape(-1, dim, stride).sum(axis=(0, 2), dtype=np.float64)
         weights = _squared_magnitudes_numpy(data.reshape(-1, dim, stride))
         return weights.sum(axis=(0, 2), dtype=np.float64)
 
@@ -226,19 +221,19 @@ def _raw_weights(
         # copied or transferred, and invalid diagonals are still rejected.
         diagonal_np = diagonal_t.detach().resolve_conj().resolve_neg().numpy()
         diagonal = _checked_diagonal_numpy(diagonal_np)
-        return diagonal.reshape(-1, dim, stride).sum(
-            axis=(0, 2), dtype=np.float64
-        )
+        return diagonal.reshape(-1, dim, stride).sum(axis=(0, 2), dtype=np.float64)
     # CUDA/MPS (and bfloat16 CPU) stay on the tensor backend.  GPU
     # validation is performed on device; only the final probabilities cross
     # the CPU/device boundary for NumPy RNG sampling.
-    diagonal = _checked_diagonal_torch(diagonal_t)
-    weights = diagonal.reshape(-1, dim, stride).sum(dim=(0, 2))
-    return weights.detach().to(device="cpu", dtype=torch.float64).numpy()
+    checked_diagonal_t = _checked_diagonal_torch(diagonal_t)
+    torch_weights = checked_diagonal_t.reshape(-1, dim, stride).sum(dim=(0, 2))
+    return torch_weights.detach().to(device="cpu", dtype=torch.float64).numpy()
 
 
 def _normalized_weights(
-    state: Qobj, dim: int, stride: int,
+    state: Qobj,
+    dim: int,
+    stride: int,
     sparse_ket_rows: list[np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     raw = _raw_weights(state, dim, stride, sparse_ket_rows)
@@ -275,7 +270,11 @@ def photon_number_probabilities(state: Qobj, mode: int = 0) -> np.ndarray:
 
 
 def _project(
-    state: Qobj, dim: int, stride: int, outcome: int, weight: float,
+    state: Qobj,
+    dim: int,
+    stride: int,
+    outcome: int,
+    weight: float,
     sparse_ket_rows: np.ndarray | None = None,
 ) -> Qobj:
     """Apply the selected number projector; preserve backend, dims and type."""
@@ -287,7 +286,9 @@ def _project(
         result = data / normalization
     elif isinstance(data, csr_array):
         if state.qtype == Qtype.ket:
-            rows = sparse_ket_rows if sparse_ket_rows is not None else _csr_ket_rows(data)
+            rows = (
+                sparse_ket_rows if sparse_ket_rows is not None else _csr_ket_rows(data)
+            )
             keep = (rows // stride) % dim == outcome
             kept_rows = rows[keep]
             result = csr_array(
@@ -309,9 +310,8 @@ def _project(
             )
         else:
             entries = data.tocoo(copy=False)
-            keep = (
-                ((entries.row // stride) % dim == outcome)
-                & ((entries.col // stride) % dim == outcome)
+            keep = ((entries.row // stride) % dim == outcome) & (
+                (entries.col // stride) % dim == outcome
             )
             result = csr_array(
                 (
@@ -324,9 +324,7 @@ def _project(
         if isinstance(data, np.ndarray):
             # Convert only surviving coefficients when the input is integer:
             # no full-sized dtype-promotion copy is needed.
-            output_dtype = (
-                np.float64 if data.dtype.kind in "biu" else data.dtype
-            )
+            output_dtype = np.float64 if data.dtype.kind in "biu" else data.dtype
             output = np.zeros(data.shape, dtype=output_dtype)
             output.reshape(-1, dim, stride)[:, outcome, :] = (
                 data.reshape(-1, dim, stride)[:, outcome, :] / normalization
@@ -337,13 +335,13 @@ def _project(
 
             if not isinstance(data, torch.Tensor):
                 raise TypeError("unsupported Qobj data backend")
-            output_dtype = data.dtype
+            torch_output_dtype = data.dtype
             if not (data.is_floating_point() or data.is_complex()):
-                output_dtype = (
+                torch_output_dtype = (
                     torch.float32 if data.device.type == "mps" else torch.float64
                 )
             output_t = torch.zeros(
-                data.shape, dtype=output_dtype, device=data.device
+                data.shape, dtype=torch_output_dtype, device=data.device
             )
             output_t.reshape(-1, dim, stride)[:, outcome, :] = (
                 data.reshape(-1, dim, stride)[:, outcome, :] / normalization
@@ -355,9 +353,7 @@ def _project(
         size = data.shape[0]
         lead = size // (dim * stride)
         if isinstance(data, np.ndarray):
-            output_dtype = (
-                np.float64 if data.dtype.kind in "biu" else data.dtype
-            )
+            output_dtype = np.float64 if data.dtype.kind in "biu" else data.dtype
             output = np.zeros(data.shape, dtype=output_dtype)
             if lead == 1:
                 lo, hi = outcome * stride, (outcome + 1) * stride
@@ -386,34 +382,31 @@ def _project(
 
             if not isinstance(data, torch.Tensor):
                 raise TypeError("unsupported Qobj data backend")
-            output_dtype = data.dtype
+            torch_output_dtype = data.dtype
             if not (data.is_floating_point() or data.is_complex()):
-                output_dtype = (
+                torch_output_dtype = (
                     torch.float32 if data.device.type == "mps" else torch.float64
                 )
             output_t = torch.zeros(
-                data.shape, dtype=output_dtype, device=data.device
+                data.shape, dtype=torch_output_dtype, device=data.device
             )
             if lead == 1:
                 lo, hi = outcome * stride, (outcome + 1) * stride
-                output_t[lo:hi, lo:hi] = (
-                    data[lo:hi, lo:hi] / normalization
-                )
+                output_t[lo:hi, lo:hi] = data[lo:hi, lo:hi] / normalization
             elif data.is_contiguous():
-                source6 = data.reshape(lead, dim, stride, lead, dim, stride)
-                output6 = output_t.reshape(lead, dim, stride, lead, dim, stride)
-                output6[:, outcome, :, :, outcome, :] = (
-                    source6[:, outcome, :, :, outcome, :] / normalization
+                source6_t = data.reshape(lead, dim, stride, lead, dim, stride)
+                output6_t = output_t.reshape(lead, dim, stride, lead, dim, stride)
+                output6_t[:, outcome, :, :, outcome, :] = (
+                    source6_t[:, outcome, :, :, outcome, :] / normalization
                 )
             else:
-                idx = (
-                    torch.arange(lead, device=data.device)[:, None]
-                    * (dim * stride)
+                idx_t = (
+                    torch.arange(lead, device=data.device)[:, None] * (dim * stride)
                     + outcome * stride
                     + torch.arange(stride, device=data.device)[None, :]
                 ).reshape(-1)
-                output_t[idx[:, None], idx[None, :]] = (
-                    data[idx[:, None], idx[None, :]] / normalization
+                output_t[idx_t[:, None], idx_t[None, :]] = (
+                    data[idx_t[:, None], idx_t[None, :]] / normalization
                 )
             result = output_t
     return Qobj(result, dims=state.dims, qtype=state.qtype, tol=state._tol)
@@ -459,8 +452,9 @@ def measure_photon_number(
     # grouping.  Reuse them when projecting rather than scanning/searching
     # the CSR structure twice.  No cache is held between API calls.
     cached_rows = (
-        [] if collapse and isinstance(state._data, csr_array)
-        and state.qtype == Qtype.ket else None
+        []
+        if collapse and isinstance(state._data, csr_array) and state.qtype == Qtype.ket
+        else None
     )
     probabilities, raw = _normalized_weights(
         state, dim, stride, sparse_ket_rows=cached_rows
@@ -471,10 +465,17 @@ def measure_photon_number(
     if shots == 1:
         outcome = int(generator.choice(dim, p=probabilities))
         return (
-            (outcome, _project(
-                state, dim, stride, outcome, float(raw[outcome]),
-                sparse_ket_rows=cached_rows[0] if cached_rows else None,
-            ))
+            (
+                outcome,
+                _project(
+                    state,
+                    dim,
+                    stride,
+                    outcome,
+                    float(raw[outcome]),
+                    sparse_ket_rows=cached_rows[0] if cached_rows else None,
+                ),
+            )
             if collapse
             else outcome
         )
