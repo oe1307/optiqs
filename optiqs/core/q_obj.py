@@ -45,7 +45,13 @@ class Qobj:
             np_dtype = _to_numpy_dtype(dtype)
             _data = sp.sparse.csr_array(cast(Any, data), dtype=np_dtype, copy=True)
             _data.sum_duplicates()
-            _data.data[np.abs(_data.data) < tol] = 0
+            # np.abs(np.int64(-2**63)) wraps around to a negative value.
+            # No nonzero integer can be smaller than a tolerance <= 1;
+            # otherwise, promote signed integers before the magnitude check.
+            if _data.dtype.kind != "i":
+                _data.data[np.abs(_data.data) < tol] = 0
+            elif tol > 1:
+                _data.data[np.abs(_data.data.astype(np.float64)) < tol] = 0
             _data.eliminate_zeros()
         elif isinstance(data, np.ndarray) or isinstance(data, list):
             np_dtype = _to_numpy_dtype(dtype)

@@ -102,17 +102,14 @@ def gkp(
 
     # Only even Fock components are required
     coeff = np.empty((dim + 1) // 2, dtype=np.float64)
-
     c_prev = np.zeros_like(c0)
     c_curr = c0
 
     for k in range(dim):
         if k % 2 == 0:
             coeff[k // 2] = np.dot(weights, c_curr)
-
         if k + 1 < dim:
             c_next = (beta * c_curr - t * np.sqrt(k) * c_prev) / np.sqrt(k + 1)
-
             c_prev, c_curr = c_curr, c_next
 
     # Normalize
@@ -128,10 +125,7 @@ def gkp(
         raise ValueError("No coefficients remain after applying tol")
 
     data = csr_array(
-        (
-            coeff[mask],
-            (n[mask], np.zeros(np.count_nonzero(mask), dtype=int)),
-        ),
+        (coeff[mask], (n[mask], np.zeros(np.count_nonzero(mask), dtype=int))),
         shape=(dim, 1),
     )
 
