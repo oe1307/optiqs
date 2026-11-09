@@ -515,13 +515,59 @@ class LazyCachedOperator:
         """Lazy inverse of the exponential, ``exp(-A)``."""
         return self._derived(-self._data)
 
+    def _dense_block(self, block_id: int) -> np.ndarray:
+        """Materialize one invariant block, reusing an existing cache entry.
+
+        Explicit materialization does not populate the application cache:
+        keeping every block *and* the assembled operator would duplicate
+        potentially large amounts of memory.
+        """
+        with self._lock:
+            cached = self._cache.get(block_id)
+            generator = self._block_data.get(block_id)
+        if cached is not None:
+            return cached
+        if generator is None:
+            generator = self._slice_generator(self._blocks[block_id])
+        dense = generator if isinstance(generator, np.ndarray) else generator.toarray()
+        return np.asarray(expm(dense))
+
+    def to_sparse_qobj(self) -> Qobj:
+        """Materialize the exponential as a block-sparse CSR operator.
+
+        Only the supplied invariant blocks are exponentiated. Storage is
+        O(sum(block_size**2)), rather than O(full_dimension**2). This is an
+        explicit, potentially expensive operation; unlike the lazy action,
+        it constructs every block, including those not yet used by a state.
+        """
+        size = self.shape[0]
+        row_counts = np.empty(size, dtype=np.intp)
+        for ix in self._blocks:
+            row_counts[ix] = ix.size
+        indptr = np.empty(size + 1, dtype=np.intp)
+        indptr[0] = 0
+        np.cumsum(row_counts, out=indptr[1:])
+
+        indices = np.empty(int(indptr[-1]), dtype=np.intp)
+        values = np.empty(int(indptr[-1]), dtype=np.result_type(self.dtype, np.float32))
+        for block_id, ix in enumerate(self._blocks):
+            matrix = self._dense_block(block_id)
+            for local_row, global_row in enumerate(ix):
+                start = int(indptr[global_row])
+                end = start + ix.size
+                indices[start:end] = ix
+                values[start:end] = matrix[local_row]
+
+        result = sparse.csr_array((values, indices, indptr), shape=self.shape)
+        result.sort_indices()
+        return Qobj(result, dims=self.dims, qtype=Qtype.oper, tol=self._tol)
+
     def to_qobj(self) -> Qobj:
-        """Explicitly materialize the full dense exponential (O(N**2) memory)."""
-        base = object.__new__(Expm)
-        base._data = self._data.copy()
-        base._dims = self._dims
-        base._tol = self._tol
-        return base.to_qobj()
+        """Materialize the dense exponential using its invariant blocks."""
+        dense = np.zeros(self.shape, dtype=np.result_type(self.dtype, np.float32))
+        for block_id, ix in enumerate(self._blocks):
+            dense[np.ix_(ix, ix)] = self._dense_block(block_id)
+        return Qobj(dense, dims=self.dims, qtype=Qtype.oper, tol=self._tol)
 
     def __repr__(self) -> str:
         info = self.cache_info()
