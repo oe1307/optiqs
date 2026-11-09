@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from math import prod, sqrt
-from numbers import Integral
+from math import isfinite, log, log1p, prod, sqrt
+from numbers import Integral, Real
 from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import csr_array
+from scipy.special import gammaln
 
 from optiqs.core.q_obj import Qobj, Qtype
 from optiqs.measurements.photon_number import (
@@ -89,6 +90,55 @@ def _outcomes(
                 f"outcome for mode {mode} must satisfy 0 <= n < {dims[mode]}"
             )
     return tuple(int(number) for number in values)
+
+
+def _loss_probability(eta: float) -> float:
+    """Validate a detector *loss probability*, not channel transmissivity."""
+    if isinstance(eta, (bool, np.bool_)) or not isinstance(eta, Real):
+        raise TypeError("eta must be a real number in [0, 1]")
+    if not isfinite(eta) or not 0 <= eta <= 1:
+        raise ValueError("eta must be finite and in [0, 1]")
+    return float(eta)
+
+
+def _loss_row(dim: int, detected: int, eta: float) -> np.ndarray:
+    """P(detected | incident=n), n=0,...,dim-1, without factorial overflow."""
+    row = np.zeros(dim, dtype=np.float64)
+    if eta == 0.0:
+        row[detected] = 1.0
+    elif eta == 1.0:
+        if detected == 0:
+            row[:] = 1.0
+    else:
+        initial = np.arange(detected, dim)
+        row[detected:] = np.exp(
+            gammaln(initial + 1)
+            - gammaln(detected + 1)
+            - gammaln(initial - detected + 1)
+            + detected * log1p(-eta)
+            + (initial - detected) * log(eta)
+        )
+    return row
+
+
+def _loss_kernel(dim: int, eta: float) -> np.ndarray:
+    """Binomial thinning matrix, rows=detected and columns=incident counts."""
+    kernel = np.zeros((dim, dim), dtype=np.float64)
+    for detected in range(dim):
+        kernel[detected, detected:] = _loss_row(dim, detected, eta)[detected:]
+    return kernel
+
+
+def _loss_parent_weights(
+    dims: tuple[int, ...], modes: tuple[int, ...], outcomes: tuple[int, ...], eta: float
+) -> np.ndarray:
+    """Probability of one detected tuple conditional on each incident tuple."""
+    shape = tuple(dims[mode] for mode in modes)
+    weights = np.ones(shape, dtype=np.float64)
+    for axis, (mode, outcome) in enumerate(zip(modes, outcomes)):
+        axis_shape = (1,) * axis + (dims[mode],) + (1,) * (len(modes) - axis - 1)
+        weights *= _loss_row(dims[mode], outcome, eta).reshape(axis_shape)
+    return weights.reshape(-1)
 
 
 def _strides(dims: tuple[int, ...]) -> tuple[int, ...]:
@@ -501,10 +551,17 @@ def _checked_total(weights: np.ndarray) -> float:
 def _normalized_joint_weights(
     state: Qobj, dims: tuple[int, ...], modes: tuple[int, ...]
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    raw = _raw_joint_weights(state, dims, modes)
+    with np.errstate(over="ignore", under="ignore"):
+        raw = _raw_joint_weights(state, dims, modes)
     scale = 1.0
     try:
-        total = _checked_total(raw)
+        with np.errstate(over="ignore", under="ignore"):
+            total = _checked_total(raw)
+        if total < 1e-300:
+            # Subnormal weights may have a positive total while individual
+            # reductions are badly rounded. Scale *before* accumulating.
+            raw, scale = _scaled_joint_weights(state, dims, modes)
+            total = _checked_total(raw)
     except ValueError:
         raw, scale = _scaled_joint_weights(state, dims, modes)
         total = _checked_total(raw)
@@ -512,7 +569,7 @@ def _normalized_joint_weights(
 
 
 def joint_photon_number_probabilities(
-    state: Qobj, modes: Sequence[int] | None = None
+    state: Qobj, modes: Sequence[int] | None = None, *, eta: float = 0.0
 ) -> np.ndarray:
     """Exact Born distribution of *two or more* photon-count modes.
 
@@ -520,10 +577,40 @@ def joint_photon_number_probabilities(
     the order in ``modes`` (even if unsorted); unselected modes are marginalized.
     Kets, bras and density operators work with NumPy, SciPy CSR and PyTorch.
     Unnormalized states are accepted, invalid diagonals/zero norms rejected.
-    Returns a NumPy array. No RNG is used.
+    ``eta`` is the independent photon *loss probability* of each measured
+    mode: 0 is ideal detection, 1 means no photons survive. It has the same
+    meaning as in ``measure_photon_number``, and is the complement of the
+    ``photon_loss`` channel's transmissivity. The loss is applied before the
+    measurement; unmeasured modes are unaffected.
+
+    With loss, first marginalize the input to its joint number distribution,
+    then apply independent binomial-thinning matrices along the measured axes.
+    This avoids constructing the (potentially enormous) lossy density matrix
+    and works on every Qobj backend. Returns a NumPy array; no RNG is used.
     """
     dims, selected = _modes_and_dims(state, modes)
+    eta = _loss_probability(eta)
     normalized, _, _ = _normalized_joint_weights(state, dims, selected)
+    if eta == 0.0:
+        return normalized
+    if eta == 1.0:
+        result = np.zeros_like(normalized)
+        result[(0,) * len(selected)] = 1.0
+        return result
+
+    # Only the joint-number tensor and small per-mode transition matrices
+    # are needed. No D x D state or multi-mode Kraus operators are formed.
+    kernels: dict[int, np.ndarray] = {}
+    for axis, mode in enumerate(selected):
+        dim = dims[mode]
+        if dim not in kernels:
+            kernels[dim] = _loss_kernel(dim, eta)
+        normalized = np.moveaxis(
+            np.tensordot(kernels[dim], normalized, axes=(1, axis)), 0, axis
+        )
+    # Compensate for the last rounding error in column sums of binomial
+    # matrices, especially for high Fock cutoffs.
+    normalized /= normalized.sum(dtype=np.float64)
     return normalized
 
 
@@ -648,6 +735,342 @@ def _branch_weight(
         .item()
     )
     return branch, total, 1.0
+
+
+def _lossy_branch_probability(
+    state: Qobj,
+    dims: tuple[int, ...],
+    modes: tuple[int, ...],
+    parent_weights: np.ndarray,
+) -> float:
+    """One lossy outcome probability, without allocating a joint histogram."""
+    data = state._data
+    if isinstance(data, csr_array):
+        with np.errstate(over="ignore", under="ignore"):
+            basis_indices, basis_weights = _sparse_basis_weights(state)
+    elif isinstance(data, np.ndarray):
+        basis_indices = np.arange(prod(dims), dtype=np.intp)
+        with np.errstate(over="ignore", under="ignore"):
+            basis_weights = (
+                _numpy_vector_weights(data.reshape(-1))
+                if state.is_vector()
+                else _checked_diagonal_numpy(np.diagonal(data))
+            )
+    else:
+        import torch
+
+        if not isinstance(data, torch.Tensor):
+            raise TypeError("unsupported Qobj data backend")
+        checked = _torch_checked_weights(data, vector=state.is_vector())
+        if not isinstance(checked, np.ndarray):
+            accumulation = torch.float64 if data.device.type != "mps" else checked.dtype
+            total = float(checked.sum(dtype=accumulation).item())
+            if (
+                np.isfinite(total)
+                and total >= 1e-300
+                and torch.isfinite(checked).all().item()
+                and not (checked < 0).any().item()
+            ):
+                positions = torch.arange(prod(dims), device=data.device)
+                strides = _strides(dims)
+                torch_labels = torch.zeros_like(positions)
+                for mode in modes:
+                    torch_labels = (
+                        torch_labels * dims[mode]
+                        + (positions // strides[mode]) % dims[mode]
+                    )
+                factors = torch.as_tensor(
+                    parent_weights, dtype=accumulation, device=data.device
+                ).index_select(0, torch_labels)
+                branch = (checked.to(accumulation) * factors).sum().item()
+                return float(branch / total)
+            # Extremely large/small unnormalized GPU values: use the existing
+            # stable, scaled basis-weight fallback, never a dense state copy.
+            basis_weights, _ = _scaled_basis_weights(state)
+        else:
+            basis_weights = checked
+        basis_indices = np.arange(prod(dims), dtype=np.intp)
+
+    try:
+        with np.errstate(over="ignore", under="ignore"):
+            total = _checked_total(np.asarray(basis_weights))
+        if total < 1e-300:
+            basis_weights, _ = _scaled_basis_weights(state)
+            total = _checked_total(basis_weights)
+    except ValueError:
+        basis_weights, _ = _scaled_basis_weights(state)
+        total = _checked_total(basis_weights)
+    basis_labels = _flat_outcomes(basis_indices, dims, modes)
+    branch = float(
+        np.sum(
+            np.asarray(basis_weights, dtype=np.float64) * parent_weights[basis_labels],
+            dtype=np.float64,
+        )
+    )
+    return branch / total
+
+
+def _lossy_branch_block(
+    state: Qobj,
+    dims: tuple[int, ...],
+    modes: tuple[int, ...],
+    parent_weights: np.ndarray,
+) -> np.ndarray | csr_array | torch.Tensor:
+    """Unnormalized conditional *unmeasured* block after independent loss.
+
+    A detected tuple receives contributions only from incident tuples with
+    the same photon numbers on both density-matrix indices. This lets us
+    avoid materializing the lossy D x D state (and all its Kraus branches).
+    """
+    remaining = tuple(i for i in range(len(dims)) if i not in modes)
+    size = prod(dims[i] for i in remaining)
+    data = state._data
+
+    if isinstance(data, csr_array):
+        if state.is_vector():
+            indices = _csr_ket_rows(data) if state.qtype == Qtype.ket else data.indices
+            parents = _flat_outcomes(indices, dims, modes)
+            weights = parent_weights[parents]
+            active = weights > 0
+            parents = parents[active]
+            rest = _remaining_index(indices[active], dims, remaining)
+            amplitudes = data.data[active]
+            if state.qtype == Qtype.bra:
+                amplitudes = amplitudes.conj()
+            amplitudes = _safe_numpy_amplitudes(amplitudes)
+            # Normalize *before* outer products. Otherwise a perfectly valid
+            # unnormalized ket of size 1e-200 or 1e200 under/overflows while
+            # forming the conditional density. The probability is computed
+            # separately from stable basis weights.
+            scale = max(
+                float(np.max(np.abs(np.real(amplitudes)), initial=0.0)),
+                float(np.max(np.abs(np.imag(amplitudes)), initial=0.0))
+                if np.iscomplexobj(amplitudes)
+                else 0.0,
+            )
+            if scale:
+                amplitudes = _divide_numpy_real(amplitudes, scale)
+            amplitudes = amplitudes * np.sqrt(weights[active])
+            if scale:
+                amplitudes = amplitudes / np.linalg.norm(amplitudes)
+            result = csr_array(
+                (size, size), dtype=np.result_type(amplitudes.dtype, np.float64)
+            )
+            # No full-size state or dense reduced block; one sparse outer
+            # product per *occupied* incident photon-number tuple.
+            if len(parents):
+                order = np.argsort(parents, kind="stable")
+                sorted_parents = parents[order]
+                boundaries = np.append(
+                    np.flatnonzero(sorted_parents[1:] != sorted_parents[:-1]) + 1,
+                    len(order),
+                )
+                start = 0
+                for stop in boundaries:
+                    chosen = order[start:stop]
+                    column = csr_array(
+                        (
+                            amplitudes[chosen],
+                            (rest[chosen], np.zeros(len(chosen), dtype=np.intp)),
+                        ),
+                        shape=(size, 1),
+                    )
+                    result = result + column @ column.conj().T
+                    start = int(stop)
+            return result
+
+        entries = data.tocoo(copy=False)
+        row_parents = _flat_outcomes(entries.row, dims, modes)
+        col_parents = _flat_outcomes(entries.col, dims, modes)
+        keep = (row_parents == col_parents) & (parent_weights[row_parents] > 0)
+        rows = _remaining_index(entries.row[keep], dims, remaining)
+        cols = _remaining_index(entries.col[keep], dims, remaining)
+        diagonal = entries.data[entries.row == entries.col]
+        scale = float(np.max(np.real(diagonal), initial=0.0))
+        values = _divide_numpy_real(entries.data[keep], scale if scale > 0 else 1.0)
+        values = values * parent_weights[row_parents[keep]]
+        return csr_array((values, (rows, cols)), shape=(size, size))
+
+    parents_shape = tuple(dims[i] for i in modes)
+    active_parents = np.flatnonzero(parent_weights > 0)
+    if isinstance(data, np.ndarray):
+        if state.is_vector():
+            amplitudes = _safe_numpy_amplitudes(data.reshape(-1))
+            if state.qtype == Qtype.bra:
+                amplitudes = amplitudes.conj()
+            arranged = (
+                amplitudes.reshape(dims)
+                .transpose((*modes, *remaining))
+                .reshape(-1, size)
+            )
+            weighted = arranged[active_parents]
+            scale = max(
+                float(np.max(np.abs(np.real(weighted)), initial=0.0)),
+                float(np.max(np.abs(np.imag(weighted)), initial=0.0))
+                if np.iscomplexobj(weighted)
+                else 0.0,
+            )
+            if scale:
+                weighted = _divide_numpy_real(weighted, scale)
+            weighted = weighted * np.sqrt(parent_weights[active_parents, None])
+            if scale:
+                weighted = weighted / np.linalg.norm(weighted)
+            return weighted.T @ weighted.conj()
+
+        # Work in units of the largest density diagonal. The branch is
+        # normalized afterwards, so this scaling prevents under/overflow of
+        # individual blocks and their sum for extreme unnormalized states.
+        diagonal_scale = float(np.max(np.real(np.diagonal(data)), initial=0.0))
+        if diagonal_scale <= 0:
+            diagonal_scale = 1.0
+        output = np.zeros((size, size), dtype=np.result_type(data.dtype, np.float64))
+        for parent in active_parents:
+            incident = tuple(
+                int(n) for n in np.unravel_index(int(parent), parents_shape)
+            )
+            positions, _ = _selected_indices(dims, dict(zip(modes, incident)))
+            block = _divide_numpy_real(
+                data[np.ix_(positions, positions)], diagonal_scale
+            )
+            output += parent_weights[parent] * block
+        return output
+
+    import torch
+
+    if not isinstance(data, torch.Tensor):
+        raise TypeError("unsupported Qobj data backend")
+    if state.is_vector():
+        amplitudes_t = _safe_torch_amplitudes(data).reshape(-1)
+        if data.device.type != "mps" and amplitudes_t.dtype in (
+            torch.float32,
+            torch.complex64,
+        ):
+            amplitudes_t = amplitudes_t.to(
+                torch.complex128 if amplitudes_t.is_complex() else torch.float64
+            )
+        if state.qtype == Qtype.bra:
+            amplitudes_t = amplitudes_t.conj()
+        arranged_t = (
+            amplitudes_t.reshape(dims).permute((*modes, *remaining)).reshape(-1, size)
+        )
+        chosen_t = torch.as_tensor(active_parents, device=data.device, dtype=torch.long)
+        factors = torch.as_tensor(
+            np.sqrt(parent_weights[active_parents]),
+            device=data.device,
+            dtype=arranged_t.real.dtype,
+        )
+        weighted_t = arranged_t.index_select(0, chosen_t)
+        scale_t = weighted_t.abs().amax()
+        if scale_t.item() > 0:
+            weighted_t = weighted_t / scale_t
+        weighted_t = weighted_t * factors[:, None]
+        if scale_t.item() > 0:
+            weighted_t = weighted_t / torch.linalg.vector_norm(weighted_t)
+        return weighted_t.transpose(0, 1) @ weighted_t.conj()
+
+    density = _torch_coefficients(data)
+    diagonal_scale_t = density.diagonal().real.amax()
+    if diagonal_scale_t.item() <= 0:
+        diagonal_scale_t = torch.ones_like(diagonal_scale_t)
+    result_t = torch.zeros((size, size), device=data.device, dtype=density.dtype)
+    for parent in active_parents:
+        incident = tuple(int(n) for n in np.unravel_index(int(parent), parents_shape))
+        positions, _ = _selected_indices(dims, dict(zip(modes, incident)))
+        selected_t = torch.as_tensor(positions, device=data.device, dtype=torch.long)
+        result_t = result_t + parent_weights[parent] * (
+            density.index_select(0, selected_t).index_select(1, selected_t)
+            / diagonal_scale_t
+        )
+    return result_t
+
+
+def _lossy_project_joint(
+    state: Qobj,
+    dims: tuple[int, ...],
+    modes: tuple[int, ...],
+    outcomes: tuple[int, ...],
+    discard: bool,
+    parent_weights: np.ndarray,
+) -> Qobj:
+    """Return the normalized conditional density, without a full loss channel."""
+    remaining = tuple(i for i in range(len(dims)) if i not in modes)
+    output: np.ndarray | csr_array | torch.Tensor
+    if not remaining:
+        # Measuring every mode fixes the post-measurement state exactly:
+        # only the selected Fock basis diagonal survives, even with loss.
+        position, _ = _selected_indices(dims, dict(zip(modes, outcomes)))
+        data = state._data
+        if isinstance(data, csr_array):
+            output = csr_array(
+                (np.ones(1), (position, position)),
+                shape=data.shape
+                if state.qtype == Qtype.oper
+                else (prod(dims), prod(dims)),
+            )
+        elif isinstance(data, np.ndarray):
+            output = np.zeros(
+                (prod(dims), prod(dims)),
+                dtype=np.result_type(data.dtype, np.float64),
+            )
+            output[position[0], position[0]] = 1.0
+        else:
+            import torch
+
+            assert isinstance(data, torch.Tensor)
+            output = torch.zeros(
+                (prod(dims), prod(dims)),
+                device=data.device,
+                dtype=_torch_coefficients(data).dtype,
+            )
+            output[position[0], position[0]] = 1.0
+        return Qobj(output, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
+
+    block = _lossy_branch_block(state, dims, modes, parent_weights)
+    if isinstance(block, csr_array):
+        norm = float(np.real(np.sum(block.diagonal(), dtype=np.complex128)))
+        if not np.isfinite(norm) or norm <= 0:
+            raise ValueError("post-selected joint outcome has zero probability")
+        block = block / norm
+    elif isinstance(block, np.ndarray):
+        norm = float(np.real(np.trace(block)))
+        if not np.isfinite(norm) or norm <= 0:
+            raise ValueError("post-selected joint outcome has zero probability")
+        block = block / norm
+    else:
+        import torch
+
+        assert isinstance(block, torch.Tensor)
+        norm_t = block.diagonal().real.sum()
+        if not torch.isfinite(norm_t).item() or norm_t.item() <= 0:
+            raise ValueError("post-selected joint outcome has zero probability")
+        block = block / norm_t
+
+    output_dims = tuple(dims[i] for i in remaining)
+    if discard:
+        return Qobj(
+            block, dims=(output_dims, output_dims), qtype=Qtype.oper, tol=state._tol
+        )
+
+    positions, _ = _selected_indices(dims, dict(zip(modes, outcomes)))
+    dimension = prod(dims)
+    if isinstance(block, csr_array):
+        entries = block.tocoo(copy=False)
+        output = csr_array(
+            (entries.data, (positions[entries.row], positions[entries.col])),
+            shape=(dimension, dimension),
+        )
+    elif isinstance(block, np.ndarray):
+        output = np.zeros((dimension, dimension), dtype=block.dtype)
+        output[np.ix_(positions, positions)] = block
+    else:
+        import torch
+
+        output = torch.zeros(
+            (dimension, dimension), dtype=block.dtype, device=block.device
+        )
+        pos_t = torch.as_tensor(positions, dtype=torch.long, device=block.device)
+        output[pos_t[:, None], pos_t[None, :]] = block
+    return Qobj(output, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
 
 
 def _normalized_numpy_values(
@@ -812,23 +1235,38 @@ def post_select_joint(
     modes: Sequence[int] | None = None,
     *,
     discard: bool = False,
+    eta: float = 0.0,
 ) -> tuple[Qobj, float]:
-    """Project a user-specified >=2-mode photon-count result, without RNG.
+    """Condition on a specified >=2-mode photon-count result, without RNG.
 
     Return ``(normalized_conditional_state, success_probability)``. The
     measured modes are retained unless ``discard=True``; then at least one
     unmeasured mode must remain. A zero-probability outcome raises ValueError.
     The input state is unchanged and the Qobj backend is preserved.
 
-    Unlike requesting the full joint distribution, this function computes
-    only the requested branch weight, without a potentially huge histogram.
+    ``eta`` is the photon loss probability *per measured mode*, as in
+    ``measure_photon_number``. With loss the conditional state is a density
+    operator even for a ket/bra. The detected outcome is conditioned *after*
+    the exact independent loss channel, including its unobserved Kraus events.
+    Only the requested conditional block is constructed: neither a full
+    joint histogram nor a full lossy density matrix is required.
     """
     dims, modes = _modes_and_dims(state, modes)
     numbers = _outcomes(outcomes, modes, dims)
+    eta = _loss_probability(eta)
     if not isinstance(discard, bool):
         raise TypeError("discard must be a bool")
     if discard and len(modes) == len(dims):
         raise ValueError("cannot discard every mode; pass discard=False")
+    if eta:
+        parent_weights = _loss_parent_weights(dims, modes, numbers, eta)
+        probability = _lossy_branch_probability(state, dims, modes, parent_weights)
+        if probability <= 0:
+            raise ValueError("post-selected joint outcome has zero probability")
+        return (
+            _lossy_project_joint(state, dims, modes, numbers, discard, parent_weights),
+            float(probability),
+        )
     selected = dict(zip(modes, numbers))
     weight, total, scale = _branch_weight(state, dims, selected)
     if weight <= 0:
@@ -844,17 +1282,22 @@ def measure_joint_photon_number(
     *,
     outcomes: Sequence[int] | None = None,
     discard: bool = False,
+    eta: float = 0.0,
 ) -> np.ndarray | tuple[Qobj, float]:
     """Backwards-compatible RNG-free probability/post-selection convenience API.
 
     Without ``outcomes`` return the joint Born tensor; with ``outcomes`` return
-    ``(post_selected_state, probability)``. Never samples an observed result.
+    ``(post_selected_state, probability)``. ``eta`` is the independent photon
+    loss probability for each measured mode (0 = ideal, 1 = complete loss).
+    Probability-only measurements use fast binomial thinning, while selected
+    states are calculated exactly without generating the full lossy state.
+    Never samples an observed result.
     """
     if outcomes is None:
         if discard:
             raise ValueError("discard=True requires explicit outcomes")
-        return joint_photon_number_probabilities(state, modes)
-    return post_select_joint(state, outcomes, modes, discard=discard)
+        return joint_photon_number_probabilities(state, modes, eta=eta)
+    return post_select_joint(state, outcomes, modes, discard=discard, eta=eta)
 
 
 def _sparse_branches(
@@ -958,7 +1401,11 @@ def _sparse_branches(
 
 
 def joint_photon_number_branches(
-    state: Qobj, modes: Sequence[int] | None = None, *, discard: bool = False
+    state: Qobj,
+    modes: Sequence[int] | None = None,
+    *,
+    discard: bool = False,
+    eta: float = 0.0,
 ) -> dict[tuple[int, ...], tuple[float, Qobj]]:
     """Enumerate all nonzero-probability joint measurement branches (no RNG).
 
@@ -966,13 +1413,28 @@ def joint_photon_number_branches(
     ``(probability, normalized_conditional_Qobj)``. Zero-probability outcomes
     are omitted. Sparse states enumerate only occupied outcome bins without
     materializing the full probability tensor; dense states compute it once.
+    ``eta`` independently removes each measured-mode photon with that
+    probability before detection. With loss, even sparse inputs can produce
+    many nonzero outcomes and all conditional states are density operators.
     Materializing many conditional states can still be very expensive.
     """
     dims, selected = _modes_and_dims(state, modes)
+    eta = _loss_probability(eta)
     if not isinstance(discard, bool):
         raise TypeError("discard must be a bool")
     if discard and len(selected) == len(dims):
         raise ValueError("cannot discard every mode; pass discard=False")
+    if eta:
+        probabilities = joint_photon_number_probabilities(state, selected, eta=eta)
+        lossy_branches: dict[tuple[int, ...], tuple[float, Qobj]] = {}
+        for counts in np.argwhere(probabilities > 0):
+            outcome = tuple(int(n) for n in counts)
+            parent_weights = _loss_parent_weights(dims, selected, outcome, eta)
+            projected = _lossy_project_joint(
+                state, dims, selected, outcome, discard, parent_weights
+            )
+            lossy_branches[outcome] = (float(probabilities[outcome]), projected)
+        return lossy_branches
     if isinstance(state._data, csr_array):
         return _sparse_branches(state, dims, selected, discard)
     probabilities, raw, scale = _normalized_joint_weights(state, dims, selected)
@@ -1115,7 +1577,9 @@ def _dephase_torch(state: Qobj, labels: np.ndarray) -> torch.Tensor:
     return result
 
 
-def measure_joint_nonselective(state: Qobj, modes: Sequence[int] | None = None) -> Qobj:
+def measure_joint_nonselective(
+    state: Qobj, modes: Sequence[int] | None = None, *, eta: float = 0.0
+) -> Qobj:
     """Apply the non-selective, >=2-mode Fock measurement channel.
 
     Implements ``rho -> sum_n Pi_n rho Pi_n``. Coherences *between* different
@@ -1126,9 +1590,50 @@ def measure_joint_nonselective(state: Qobj, modes: Sequence[int] | None = None) 
 
     The result is a D x D density matrix (potentially large); a sparse ket
     becomes a sparse density matrix, without densifying the input.
+
+    ``eta`` is the photon loss probability for each measured mode. Unlike
+    probability-only measurements, returning the non-selective density matrix
+    requires the full state channel. The input norm/trace is preserved even
+    for an unnormalized ket/bra.
     """
     dims, selected = _modes_and_dims(state, modes)
+    eta = _loss_probability(eta)
     data = state._data
+    if eta:
+        from optiqs.channels.photon_loss import photon_loss
+
+        # photon_loss(state.dm()) would silently normalize a ket/bra. Build
+        # its unnormalized density directly so this API continues preserving
+        # the original squared norm, exactly as in its eta=0 path.
+        if state.is_vector():
+            if isinstance(data, csr_array):
+                vector = data if state.qtype == Qtype.ket else data.conj().T
+                vector = vector.astype(
+                    _safe_numpy_amplitudes(vector.data).dtype, copy=False
+                )
+                density_data = vector @ vector.conj().T
+            elif isinstance(data, np.ndarray):
+                amplitudes = _safe_numpy_amplitudes(data.reshape(-1))
+                if state.qtype == Qtype.bra:
+                    amplitudes = amplitudes.conj()
+                density_data = amplitudes[:, None] * amplitudes.conj()[None, :]
+            else:
+                import torch
+
+                assert isinstance(data, torch.Tensor)
+                amplitudes_t = _safe_torch_amplitudes(data).reshape(-1)
+                if state.qtype == Qtype.bra:
+                    amplitudes_t = amplitudes_t.conj()
+                density_data = amplitudes_t[:, None] * amplitudes_t.conj()[None, :]
+            density = Qobj(
+                density_data, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol
+            )
+        else:
+            density = state
+        for mode in selected:
+            density = photon_loss(density, eta=1.0 - eta, mode=mode)
+        return measure_joint_nonselective(density, selected)
+
     # Early returns preserve backend-specific types without a mutable
     # ndarray | CSR | Tensor variable spanning multiple control-flow branches.
     if isinstance(data, csr_array):
