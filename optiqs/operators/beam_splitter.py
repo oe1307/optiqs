@@ -29,7 +29,7 @@ def beam_splitter(
     tol: float = 1e-17,
     *,
     lazy: bool = True,
-    precompute: bool = False,
+    precompute: bool = True,
     cache_dir: str | PathLike[str] | None = "~/.cache/optiqs/beam_splitter",
     max_cache_mb: float = 256.0,
 ) -> LazyCachedOperator | Qobj:
