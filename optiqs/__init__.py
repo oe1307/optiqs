@@ -2,10 +2,15 @@ from optiqs.channels import photon_loss
 from optiqs.core import Expm, Qobj, fidelity, load_state, save_state, tensor
 from optiqs.measurements import (
     homodyne_probabilities,
+    joint_photon_number_branches,
+    joint_photon_number_probabilities,
     measure_homodyne,
+    measure_joint_nonselective,
+    measure_joint_photon_number,
     measure_photon_number,
     photon_number_probabilities,
     post_select,
+    post_select_joint,
     postselect_photon_number,
 )
 from optiqs.operators import (
@@ -52,8 +57,12 @@ __all__ = [
     "gkp",
     "homodyne_probabilities",
     "identity",
+    "joint_photon_number_branches",
+    "joint_photon_number_probabilities",
     "load_state",
     "measure_homodyne",
+    "measure_joint_nonselective",
+    "measure_joint_photon_number",
     "measure_photon_number",
     "num",
     "number",
@@ -61,6 +70,7 @@ __all__ = [
     "photon_loss",
     "photon_number_probabilities",
     "post_select",
+    "post_select_joint",
     "postselect_photon_number",
     "qeye",
     "rot",

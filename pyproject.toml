@@ -12,4 +12,4 @@ optiqs = "optiqs"
 
 [project.optional-dependencies]
 gpu = ["torch"]
-dev = ["scipy-stubs", "pytest", "torch"]
+dev = ["mypy", "scipy-stubs", "pytest", "torch"]
