@@ -37,12 +37,14 @@ def beam_splitter(
 
     The convention is
 
-    ``U(theta, phi) = exp[theta * (exp(i*phi) a^dag b
-                                    - exp(-i*phi) a b^dag)]``.
+    ``U(theta, phi) = exp[theta * (exp(-i*phi) a b^dag
+                                    - exp(i*phi) a^dag b)]``.
 
     Thus, in a basis containing at least two levels per mode,
-    ``U |1,0> = cos(theta)|1,0> - exp(-i*phi)sin(theta)|0,1>``.
-    ``theta = pi/4`` gives a 50:50 beam splitter.
+    ``U |1,0> = cos(theta)|1,0> + exp(-i*phi)sin(theta)|0,1>``
+    and ``U |0,1> = cos(theta)|0,1> - exp(i*phi)sin(theta)|1,0>``.
+    The positive default ``theta = pi/4`` gives a 50:50 beam splitter
+    with the same phase/sign convention as the original develop ``bs``.
 
     The two-mode basis is ordered ``|n_a, n_b>`` with flattened index
     ``n_a * dim_b + n_b``. The generator only couples adjacent states
@@ -56,7 +58,8 @@ def beam_splitter(
         Local Fock cutoffs; a single integer uses the same cutoff for both
         modes. Each local dimension must be positive.
     theta : float, optional
-        Mixing angle in radians (``pi/4`` for 50:50).
+        Mixing angle in radians (default ``+pi/4`` for 50:50).
+        The sign of the generator follows the original develop convention.
     phi : float, optional
         Relative phase in radians. Real dtypes require a real phase factor
         (e.g. ``phi=0``); use a complex dtype otherwise.
@@ -175,8 +178,10 @@ def _lazy_beam_splitter(
     numeric_dtype = cast("np.dtype[np.inexact[Any]]", dtype)
     phase: float | complex = math.cos(phi) if dtype.kind == "f" else np.exp(1j * phi)
 
+    # Develop-compatible convention: G = exp(-i*phi)*a*b^dag
+    #                                  - exp(i*phi)*a^dag*b.
     # Each pair (n_a, n_b) with n_a < dim_a-1 and n_b > 0 contributes
-    # G[|n_a+1,n_b-1>, |n_a,n_b>] = exp(i*phi)*sqrt((n_a+1)*n_b),
+    # G[|n_a+1,n_b-1>, |n_a,n_b>] = -exp(i*phi)*sqrt((n_a+1)*n_b),
     # and the negative conjugate at the transposed entry.
     n_a, n_b = np.meshgrid(
         np.arange(dim_a - 1, dtype=np.intp),
@@ -191,7 +196,7 @@ def _lazy_beam_splitter(
 
     rows = np.concatenate((target, source))
     cols = np.concatenate((source, target))
-    data = np.concatenate((coefficient, -coefficient.conj()))
+    data = np.concatenate((-coefficient, coefficient.conj()))
     size = dim_a * dim_b
     # scipy-stubs does not reliably recognize the valid COO-style tuple
     # constructor for CSR arrays; isolate the cast at this API boundary.
@@ -225,7 +230,9 @@ def _lazy_beam_splitter(
 # Precomputed path: the optical generator and block partition above are the
 # sole source of truth for both lazy and eagerly materialized operators.
 
-_VERSION = 1
+# Changing the generator convention changes cached matrices at the same
+# (theta, phi). Use a new disk-cache key to avoid loading the old convention.
+_VERSION = 2
 
 
 class _SharedReadOnlyQobj(Qobj):
