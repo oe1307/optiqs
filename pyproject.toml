@@ -10,6 +10,9 @@ dependencies = ["numpy", "scipy"]
 [tool.setuptools.package-dir]
 optiqs = "optiqs"
 
+[tool.setuptools.package-data]
+optiqs = ["py.typed"]
+
 [project.optional-dependencies]
 gpu = ["torch"]
 dev = ["mypy", "scipy-stubs", "pytest", "torch"]
