@@ -1129,57 +1129,59 @@ def measure_joint_nonselective(state: Qobj, modes: Sequence[int] | None = None) 
     """
     dims, selected = _modes_and_dims(state, modes)
     data = state._data
-    result: np.ndarray | csr_array | torch.Tensor
-    # Validate the state without computing a potentially enormous histogram.
+    # Early returns preserve backend-specific types without a mutable
+    # ndarray | CSR | Tensor variable spanning multiple control-flow branches.
     if isinstance(data, csr_array):
         _, weights = _sparse_basis_weights(state)
         _checked_total(np.asarray(weights))
         if state.is_vector():
-            result = _dephase_sparse_vector(state, dims, selected)
+            sparse_result = _dephase_sparse_vector(state, dims, selected)
         else:
             entries = data.tocoo(copy=False)
             keep = _flat_outcomes(entries.row, dims, selected) == _flat_outcomes(
                 entries.col, dims, selected
             )
-            result = csr_array(
+            sparse_result = csr_array(
                 (entries.data[keep], (entries.row[keep], entries.col[keep])),
                 shape=data.shape,
             )
-    else:
-        if isinstance(data, np.ndarray):
-            weights = (
-                _numpy_vector_weights(data.reshape(-1))
-                if state.is_vector()
-                else _checked_diagonal_numpy(np.diagonal(data))
-            )
-            _checked_total(np.asarray(weights))
-        else:
-            import torch
+        return Qobj(sparse_result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
 
-            if not isinstance(data, torch.Tensor):
-                raise TypeError("unsupported Qobj data backend")
-            torch_weights = _torch_checked_weights(data, vector=state.is_vector())
-            if isinstance(torch_weights, np.ndarray):
-                _checked_total(torch_weights)
-            else:
-                if (
-                    not torch.isfinite(torch_weights).all().item()
-                    or (torch_weights < 0).any().item()
-                ):
-                    raise ValueError(
-                        "joint photon-number probabilities must be finite and nonnegative"
-                    )
-                total = float(
-                    torch_weights.sum(
-                        dtype=(torch.float64 if data.device.type != "mps" else None)
-                    ).item()
-                )
-                if not np.isfinite(total) or total <= 0:
-                    raise ValueError("state must have positive finite norm or trace")
+    if isinstance(data, np.ndarray):
+        weights = (
+            _numpy_vector_weights(data.reshape(-1))
+            if state.is_vector()
+            else _checked_diagonal_numpy(np.diagonal(data))
+        )
+        _checked_total(np.asarray(weights))
         dimension = data.shape[1] if state.qtype == Qtype.bra else data.shape[0]
         labels = _flat_outcomes(np.arange(dimension, dtype=np.intp), dims, selected)
-        if isinstance(data, np.ndarray):
-            result = _dephase_numpy(state, labels)
-        else:
-            result = _dephase_torch(state, labels)
-    return Qobj(result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
+        dense_result = _dephase_numpy(state, labels)
+        return Qobj(dense_result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
+
+    import torch
+
+    if not isinstance(data, torch.Tensor):
+        raise TypeError("unsupported Qobj data backend")
+    torch_weights = _torch_checked_weights(data, vector=state.is_vector())
+    if isinstance(torch_weights, np.ndarray):
+        _checked_total(torch_weights)
+    else:
+        if (
+            not torch.isfinite(torch_weights).all().item()
+            or (torch_weights < 0).any().item()
+        ):
+            raise ValueError(
+                "joint photon-number probabilities must be finite and nonnegative"
+            )
+        total = float(
+            torch_weights.sum(
+                dtype=(torch.float64 if data.device.type != "mps" else None)
+            ).item()
+        )
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError("state must have positive finite norm or trace")
+    dimension = data.shape[1] if state.qtype == Qtype.bra else data.shape[0]
+    labels = _flat_outcomes(np.arange(dimension, dtype=np.intp), dims, selected)
+    tensor_result = _dephase_torch(state, labels)
+    return Qobj(tensor_result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)

@@ -1,5 +1,14 @@
 from optiqs.channels import photon_loss
-from optiqs.core import Expm, Qobj, fidelity, load_state, save_state, tensor
+from optiqs.core import (
+    Expm,
+    LazyCachedOperator,
+    LazyCacheInfo,
+    Qobj,
+    fidelity,
+    load_state,
+    save_state,
+    tensor,
+)
 from optiqs.measurements import (
     homodyne_probabilities,
     joint_photon_number_branches,
@@ -43,6 +52,8 @@ from optiqs.utils import _to_numpy_dtype, get_device
 
 __all__ = [
     "Expm",
+    "LazyCacheInfo",
+    "LazyCachedOperator",
     "Qobj",
     "_to_numpy_dtype",
     "annihilation",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from numbers import Real
+from os import PathLike
 from typing import Any, cast
 
 import numpy as np
@@ -26,6 +27,9 @@ def beam_splitter(
     tol: float = 1e-17,
     *,
     lazy: bool = True,
+    precompute: bool = False,
+    cache_dir: str | PathLike[str] = "~/.cache/optiqs/beam_splitter",
+    max_cache_mb: float = 256.0,
 ) -> Expm | Qobj:
     """Construct a lossless beam splitter acting on two Fock modes.
 
@@ -63,6 +67,19 @@ def beam_splitter(
         ``scipy.sparse.linalg.expm_multiply`` without materializing it.
         If false, return a dense ``Qobj`` for the full unitary, which takes
         O((dim_a * dim_b)**2) memory.
+
+    precompute : bool, optional
+        When true, construct and cache a sparse unitary by exponentiating
+        individual total-photon-number blocks. Fast for repeated applications;
+        trades construction time and memory for application speed. This does
+        not change the default lazy behavior. Treat cached operators as
+        read-only because subsequent calls share the same Qobj instance.
+    cache_dir : str, optional
+        Optional directory for persisting precomputed sparse operators. Use
+        this only together with precompute=True. None disables disk caching.
+    max_cache_mb : float, optional
+        Maximum estimated final CSR storage when precompute=True (MiB).
+        Peak construction memory can be several times larger.
 
     Returns
     -------
@@ -102,6 +119,10 @@ def beam_splitter(
 
     if not isinstance(lazy, (bool, np.bool_)):
         raise TypeError("lazy must be a boolean")
+    if not isinstance(precompute, (bool, np.bool_)):
+        raise TypeError("precompute must be a boolean")
+    if precompute and not lazy:
+        raise ValueError("precompute=True is incompatible with lazy=False")
     if (
         isinstance(tol, (bool, np.bool_))
         or not isinstance(tol, Real)
@@ -131,6 +152,13 @@ def beam_splitter(
         phase: float | complex = math.cos(phi)
     else:
         phase = np.exp(1j * phi)
+
+    if precompute:
+        from optiqs.operators._cached_beam_splitter import cached_beam_splitter
+
+        return cached_beam_splitter(
+            dim_a, dim_b, theta, phi, np_dtype, tol, cache_dir, max_cache_mb
+        )
 
     # Each pair (n_a, n_b) with n_a < dim_a-1 and n_b > 0 contributes
     # G[|n_a+1,n_b-1>, |n_a,n_b>] = exp(i*phi)*sqrt((n_a+1)*n_b),
