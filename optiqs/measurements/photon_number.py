@@ -417,7 +417,7 @@ def measure_photon_number(
     mode: int = 0,
     shots: int = 1,
     *,
-    eta: float = 1.0,
+    eta: float = 0.0,
     collapse: bool = False,
     rng: np.random.Generator | int | None = None,
 ) -> int | np.ndarray | tuple[int, Qobj]:
@@ -427,20 +427,22 @@ def measure_photon_number(
     state.  ``shots>1`` samples *independent identical preparations*, returns
     an int64 NumPy array, and calculates the probability distribution once.
 
-    ``eta`` is the photon transmissivity/detection efficiency in [0, 1]:
-    1 means ideal detection, 0 means all photons are lost.  For
-    ``collapse=False`` and ``eta<1``, sample the *input* photon number and
-    thin it with a binomial draw, without constructing the lossy density
-    matrix or even the full lossy photon-number distribution.  This exactly
-    reproduces photon-number statistics from ``photon_loss(state, eta, mode)``.
+    ``eta`` is the photon loss probability in [0, 1]: 0 means no photon
+    loss (ideal detection), 1 means all photons are lost. For
+    ``collapse=False`` and ``eta>0``, sample the *input* photon number and
+    thin it with a binomial draw with survival probability ``1 - eta``,
+    without constructing the lossy density matrix or even the full lossy
+    photon-number distribution. This reproduces the photon-number statistics
+    from ``photon_loss(state, eta=1 - eta, mode=mode)``, whose ``eta`` is
+    the *transmissivity* rather than the loss probability.
 
     With ``collapse=True`` and ``shots=1``, return ``(outcome, collapsed_Qobj)``
     where the output retains the measured mode and is normalized using the
     unnormalized branch weight.  Coherences within the selected Fock subspace
-    are preserved.  If ``eta<1``, the exact photon-loss channel is applied
+    are preserved.  If ``eta>0``, the exact photon-loss channel is applied
     before projection, so the returned state is a density operator and the
-    fast sampling-only path is not used.  At ``eta=1``, the original state
-    type and behavior are preserved.  The input Qobj is never modified.
+    fast sampling-only path is not used. At ``eta=0``, the original state
+    type and behavior are preserved. The input Qobj is never modified.
 
     ``rng`` may be a NumPy Generator, integer seed, or None.  For the behavior
     of the alternative one-shot API, use ``collapse=True`` explicitly.
@@ -463,14 +465,15 @@ def measure_photon_number(
         raise TypeError("rng must be a NumPy Generator, integer seed, or None")
 
     dim, stride = _geometry(state, mode)
-    if collapse and eta < 1:
+    transmissivity = 1.0 - float(eta)
+    if collapse and eta > 0:
         # A conditional post-measurement state contains coherences/correlations
         # that cannot be obtained from the marginal photon-number distribution.
         # Use the full channel only when the caller explicitly requests it.
         from optiqs.channels.photon_loss import photon_loss
 
         return measure_photon_number(
-            photon_loss(state, eta=float(eta), mode=mode),
+            photon_loss(state, eta=transmissivity, mode=mode),
             mode=mode,
             collapse=True,
             rng=rng,
@@ -490,17 +493,17 @@ def measure_photon_number(
     generator = (
         rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
     )
-    if eta < 1:
-        if eta == 0:
+    if eta > 0:
+        if eta == 1:
             return 0 if shots == 1 else np.zeros(int(shots), dtype=np.int64)
         # For each independently prepared state, N follows the input photon
-        # number distribution and the transmitted count is Binomial(N, eta).
+        # number distribution and the transmitted count is Binomial(N, 1 - eta).
         # Works for kets, bras and density operators on every Qobj backend.
         if shots == 1:
             initial_count = int(generator.choice(dim, p=probabilities))
-            return int(generator.binomial(initial_count, float(eta)))
+            return int(generator.binomial(initial_count, transmissivity))
         initial_counts = generator.choice(dim, size=int(shots), p=probabilities)
-        return generator.binomial(initial_counts, float(eta))
+        return generator.binomial(initial_counts, transmissivity)
 
     if shots == 1:
         outcome = int(generator.choice(dim, p=probabilities))
