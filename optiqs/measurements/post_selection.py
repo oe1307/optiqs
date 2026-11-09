@@ -126,23 +126,24 @@ def _discard_number_mode(
                 torch.float32 if data.device.type == "mps" else torch.float64
             )
         if state.is_vector():
-            selected = data.reshape(lead, dim, stride)[:, outcome, :].reshape(-1)
-            result = (selected / normalization).reshape(
+            torch_selected = data.reshape(lead, dim, stride)[:, outcome, :].reshape(-1)
+            result = (torch_selected / normalization).reshape(
                 (1, output_size) if state.qtype == Qtype.bra else (output_size, 1)
             )
         elif data.is_contiguous():
-            selected = data.reshape(lead, dim, stride, lead, dim, stride)[
+            torch_selected = data.reshape(lead, dim, stride, lead, dim, stride)[
                 :, outcome, :, :, outcome, :
             ]
-            result = (selected / normalization).reshape(output_size, output_size)
+            result = (torch_selected / normalization).reshape(output_size, output_size)
         else:
-            indices = (
+            torch_indices = (
                 torch.arange(lead, device=data.device)[:, None] * (dim * stride)
                 + outcome * stride
                 + torch.arange(stride, device=data.device)[None, :]
             ).reshape(-1)
             result = (
-                data.index_select(0, indices).index_select(1, indices) / normalization
+                data.index_select(0, torch_indices).index_select(1, torch_indices)
+                / normalization
             )
 
     return Qobj(

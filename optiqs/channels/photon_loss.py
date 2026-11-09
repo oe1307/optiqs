@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import math
 from numbers import Integral, Real
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import numpy.typing as npt
 from scipy.sparse import csr_array
 from scipy.special import gammaln
 
@@ -64,10 +65,17 @@ def _apply_dense_numpy(
     )
 
     for lost in range(dim):
-        weights = _jump_amplitudes(dim, lost, eta, log_factorials).astype(
-            weight_dtype, copy=False
+        # The selected dtype is always float32 or float64; make that explicit
+        # so NumPy's typed multiplication overload accepts the arrays.
+        weights = cast(
+            "npt.NDArray[np.floating[Any]]",
+            _jump_amplitudes(dim, lost, eta, log_factorials).astype(
+                weight_dtype, copy=False
+            ),
         )
-        weight_matrix = np.outer(weights, weights)[None, :, None, None, :, None]
+        weight_matrix = (weights[:, None] * weights[None, :])[
+            None, :, None, None, :, None
+        ]
         target[:, : dim - lost, :, :, : dim - lost, :] += (
             source[:, lost:, :, :, lost:, :] * weight_matrix
         )

@@ -266,7 +266,8 @@ def _safe_numpy_dividend(values: np.ndarray, denominator: float) -> np.ndarray:
         np.dtype("float32"),
         np.dtype("complex64"),
     ):
-        real_dtype = np.float16 if values.dtype == np.float16 else np.float32
+        # A dtype string avoids type-variable conflicts in NumPy's finfo stubs.
+        real_dtype = "float16" if values.dtype == np.float16 else "float32"
         limits = np.finfo(real_dtype)
         if denominator < limits.tiny or denominator > limits.max:
             return values.astype(
@@ -278,11 +279,12 @@ def _safe_numpy_dividend(values: np.ndarray, denominator: float) -> np.ndarray:
 def _numpy_needs_precision_promotion(dtype: np.dtype, denominator: float) -> bool:
     """Cheap fast-path predicate for a normalizing real scalar."""
     if dtype == np.dtype("float16"):
-        limits = np.finfo(np.float16)
+        real_dtype = "float16"
     elif dtype in (np.dtype("float32"), np.dtype("complex64")):
-        limits = np.finfo(np.float32)
+        real_dtype = "float32"
     else:
         return False
+    limits = np.finfo(real_dtype)
     return bool(denominator < float(limits.tiny) or denominator > float(limits.max))
 
 
@@ -474,11 +476,11 @@ def _raw_joint_weights(
 
     if not isinstance(data, torch.Tensor):
         raise TypeError("unsupported Qobj data backend")
-    weights = _torch_checked_weights(data, vector=state.is_vector())
-    if isinstance(weights, np.ndarray):
-        return _reduce_numpy(weights, dims, modes)
+    torch_weights = _torch_checked_weights(data, vector=state.is_vector())
+    if isinstance(torch_weights, np.ndarray):
+        return _reduce_numpy(torch_weights, dims, modes)
     return (
-        _reduce_torch(weights, dims, modes)
+        _reduce_torch(torch_weights, dims, modes)
         .detach()
         .to(device="cpu", dtype=torch.float64)
         .numpy()
@@ -614,33 +616,35 @@ def _branch_weight(
 
     if not isinstance(data, torch.Tensor):
         raise TypeError("unsupported Qobj data backend")
-    weights = _torch_checked_weights(data, vector=state.is_vector())
-    if isinstance(weights, np.ndarray):
+    torch_weights = _torch_checked_weights(data, vector=state.is_vector())
+    if isinstance(torch_weights, np.ndarray):
         scale = 1.0
         try:
-            total = _checked_total(np.asarray(weights))
+            total = _checked_total(np.asarray(torch_weights))
         except ValueError:
-            weights, scale = _scaled_basis_weights(state)
-            total = _checked_total(weights)
-        return float(np.sum(weights[positions], dtype=np.float64)), total, scale
-    selected_pos = torch.as_tensor(positions, device=weights.device, dtype=torch.long)
+            torch_weights, scale = _scaled_basis_weights(state)
+            total = _checked_total(torch_weights)
+        return float(np.sum(torch_weights[positions], dtype=np.float64)), total, scale
+    selected_pos = torch.as_tensor(
+        positions, device=torch_weights.device, dtype=torch.long
+    )
     total = float(
-        weights.sum(
-            dtype=(torch.float64 if weights.device.type != "mps" else None)
+        torch_weights.sum(
+            dtype=(torch.float64 if torch_weights.device.type != "mps" else None)
         ).item()
     )
     if (
         not np.isfinite(total)
         or total <= 0
-        or not torch.isfinite(weights).all().item()
-        or (weights < 0).any().item()
+        or not torch.isfinite(torch_weights).all().item()
+        or (torch_weights < 0).any().item()
     ):
         scaled, scale = _scaled_basis_weights(state)
         total = _checked_total(scaled)
         return float(np.sum(scaled[positions], dtype=np.float64)), total, scale
     branch = float(
-        weights.index_select(0, selected_pos)
-        .sum(dtype=(torch.float64 if weights.device.type != "mps" else None))
+        torch_weights.index_select(0, selected_pos)
+        .sum(dtype=(torch.float64 if torch_weights.device.type != "mps" else None))
         .item()
     )
     return branch, total, 1.0
@@ -741,31 +745,31 @@ def _project_joint(
             dtype = np.dtype(np.complex128 if data.dtype.kind == "c" else np.float64)
         if state.is_vector():
             flat = data.reshape(-1)
-            selected_data = (
+            numpy_selected_data = (
                 _normalized_numpy_values(flat[indices], norm, scale)
                 if stable
                 else flat[indices] / norm
             )
             if discard:
-                out = selected_data.reshape(
+                numpy_output = numpy_selected_data.reshape(
                     (1, output_size) if state.qtype == Qtype.bra else (output_size, 1)
                 )
             else:
-                out = np.zeros(data.shape, dtype=dtype)
-                out.reshape(-1)[indices] = selected_data
+                numpy_output = np.zeros(data.shape, dtype=dtype)
+                numpy_output.reshape(-1)[indices] = numpy_selected_data
         else:
             block = np.ix_(indices, indices)
-            selected_data = (
+            numpy_selected_data = (
                 _normalized_numpy_values(data[block], norm, scale)
                 if stable
                 else data[block] / norm
             )
             if discard:
-                out = selected_data
+                numpy_output = numpy_selected_data
             else:
-                out = np.zeros(data.shape, dtype=dtype)
-                out[block] = selected_data
-        return Qobj(out, dims=output_dims, qtype=state.qtype, tol=state._tol)
+                numpy_output = np.zeros(data.shape, dtype=dtype)
+                numpy_output[block] = numpy_selected_data
+        return Qobj(numpy_output, dims=output_dims, qtype=state.qtype, tol=state._tol)
 
     import torch
 
@@ -779,25 +783,27 @@ def _project_joint(
     data = _safe_torch_dividend(data, norm)
     positions = torch.as_tensor(indices, device=data.device, dtype=torch.long)
     if state.is_vector():
-        flat = data.reshape(-1)
-        selected_data = _divide_torch_real(flat.index_select(0, positions), norm)
+        torch_flat = data.reshape(-1)
+        torch_selected_data = _divide_torch_real(
+            torch_flat.index_select(0, positions), norm
+        )
         if discard:
-            out = selected_data.reshape(
+            torch_output = torch_selected_data.reshape(
                 (1, output_size) if state.qtype == Qtype.bra else (output_size, 1)
             )
         else:
-            out = torch.zeros_like(data)
-            out.reshape(-1)[positions] = selected_data
+            torch_output = torch.zeros_like(data)
+            torch_output.reshape(-1)[positions] = torch_selected_data
     else:
-        block = _divide_torch_real(
+        torch_block = _divide_torch_real(
             data.index_select(0, positions).index_select(1, positions), norm
         )
         if discard:
-            out = block
+            torch_output = torch_block
         else:
-            out = torch.zeros_like(data)
-            out[positions[:, None], positions[None, :]] = block
-    return Qobj(out, dims=output_dims, qtype=state.qtype, tol=state._tol)
+            torch_output = torch.zeros_like(data)
+            torch_output[positions[:, None], positions[None, :]] = torch_block
+    return Qobj(torch_output, dims=output_dims, qtype=state.qtype, tol=state._tol)
 
 
 def post_select_joint(
@@ -1123,6 +1129,7 @@ def measure_joint_nonselective(state: Qobj, modes: Sequence[int] | None = None) 
     """
     dims, selected = _modes_and_dims(state, modes)
     data = state._data
+    result: np.ndarray | csr_array | torch.Tensor
     # Validate the state without computing a potentially enormous histogram.
     if isinstance(data, csr_array):
         _, weights = _sparse_basis_weights(state)
@@ -1151,19 +1158,19 @@ def measure_joint_nonselective(state: Qobj, modes: Sequence[int] | None = None) 
 
             if not isinstance(data, torch.Tensor):
                 raise TypeError("unsupported Qobj data backend")
-            weights = _torch_checked_weights(data, vector=state.is_vector())
-            if isinstance(weights, np.ndarray):
-                _checked_total(weights)
+            torch_weights = _torch_checked_weights(data, vector=state.is_vector())
+            if isinstance(torch_weights, np.ndarray):
+                _checked_total(torch_weights)
             else:
                 if (
-                    not torch.isfinite(weights).all().item()
-                    or (weights < 0).any().item()
+                    not torch.isfinite(torch_weights).all().item()
+                    or (torch_weights < 0).any().item()
                 ):
                     raise ValueError(
                         "joint photon-number probabilities must be finite and nonnegative"
                     )
                 total = float(
-                    weights.sum(
+                    torch_weights.sum(
                         dtype=(torch.float64 if data.device.type != "mps" else None)
                     ).item()
                 )
