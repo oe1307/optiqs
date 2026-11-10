@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from enum import StrEnum
-from numbers import Number
+from numbers import Integral, Number
 from os import PathLike
 from types import NotImplementedType
 from typing import TYPE_CHECKING, Any, cast
@@ -558,6 +558,67 @@ class Qobj:
             qtype=self.qtype,
             tol=self._tol,
         )
+
+    def __pow__(self, exponent: object, modulo: object = None) -> Qobj:
+        """Return the integer matrix power of a square operator.
+
+        ``A ** 0`` is the identity; negative powers use the matrix inverse.
+        The result keeps the original backend, subsystem dims, and tolerance.
+        For sparse matrices, exponentiation by squaring avoids densification.
+        """
+        if modulo is not None:
+            raise TypeError("Qobj matrix powers do not support a modulo argument")
+        if isinstance(exponent, (bool, np.bool_)) or not isinstance(exponent, Integral):
+            raise TypeError("Qobj matrix powers require an integer exponent")
+        if self.qtype != Qtype.oper:
+            raise TypeError("Qobj matrix powers require a Qtype.oper")
+        if self.dims[0] != self.dims[1]:
+            raise ValueError(
+                "Qobj matrix powers require matching input/output subsystem dims"
+            )
+
+        power = int(exponent)
+        data = self._data
+        result: np.ndarray | sp.sparse.csr_array | torch.Tensor
+        if isinstance(data, np.ndarray):
+            result = np.linalg.matrix_power(data, power)
+        elif isinstance(data, sp.sparse.csr_array):
+            if power < 0:
+                if data.shape[0] == 1:
+                    # SciPy's sparse inverse returns a 1-D ndarray for 1x1
+                    # inputs, and returns NaN rather than raising if singular.
+                    value = data[0, 0]
+                    if value == 0:
+                        raise np.linalg.LinAlgError("Singular matrix")
+                    base = sp.sparse.csr_array([[1 / value]])
+                else:
+                    try:
+                        inverse = sp.sparse.linalg.inv(data.tocsc())
+                    except RuntimeError as exc:
+                        if "singular" in str(exc).lower():
+                            raise np.linalg.LinAlgError("Singular matrix") from exc
+                        raise
+                    base = sp.sparse.csr_array(inverse)
+            else:
+                base = data
+            result = sp.sparse.eye_array(data.shape[0], format="csr", dtype=base.dtype)
+            remaining = abs(power)
+            while remaining:
+                if remaining & 1:
+                    result = sp.sparse.csr_array(result @ base)
+                remaining >>= 1
+                if remaining:
+                    base = sp.sparse.csr_array(base @ base)
+        else:
+            import torch
+
+            if not isinstance(data, torch.Tensor):
+                raise TypeError(f"Unsupported data type: {type(data)}")
+            if power < 0 and not (data.is_floating_point() or data.is_complex()):
+                data = data.to(dtype=torch.get_default_dtype())
+            result = torch.linalg.matrix_power(data, power)
+
+        return Qobj(result, dims=self.dims, qtype=self.qtype, tol=self._tol)
 
     def unit(self) -> Qobj:
         """
