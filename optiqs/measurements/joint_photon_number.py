@@ -614,6 +614,9 @@ def joint_photon_number_probabilities(
     return normalized
 
 
+joint_pnrd = joint_photon_number_probabilities
+
+
 def _selected_indices(
     dims: tuple[int, ...], selected: dict[int, int]
 ) -> tuple[np.ndarray, tuple[int, ...]]:

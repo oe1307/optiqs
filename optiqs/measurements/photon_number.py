@@ -269,6 +269,9 @@ def photon_number_probabilities(state: Qobj, mode: int = 0) -> np.ndarray:
     return _normalized_weights(state, dim, stride)[0]
 
 
+pnrd = photon_number_probabilities
+
+
 def _project(
     state: Qobj,
     dim: int,
