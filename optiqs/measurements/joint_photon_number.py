@@ -12,6 +12,7 @@ It does NOT mean predicting a random single-shot photon count.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator, Sequence
 from functools import lru_cache
 from math import isfinite, log, log1p, prod, sqrt
@@ -884,31 +885,21 @@ def _lossy_branch_block(
             amplitudes = amplitudes * np.sqrt(weights[active])
             if scale:
                 amplitudes = amplitudes / np.linalg.norm(amplitudes)
-            result = csr_array(
-                (size, size), dtype=np.result_type(amplitudes.dtype, np.float64)
-            )
-            # No full-size state or dense reduced block; one sparse outer
-            # product per *occupied* incident photon-number tuple.
-            if len(parents):
-                order = np.argsort(parents, kind="stable")
-                sorted_parents = parents[order]
-                boundaries = np.append(
-                    np.flatnonzero(sorted_parents[1:] != sorted_parents[:-1]) + 1,
-                    len(order),
+            if not parents.size:
+                return csr_array(
+                    (size, size), dtype=np.result_type(amplitudes.dtype, np.float64)
                 )
-                start = 0
-                for stop in boundaries:
-                    chosen = order[start:stop]
-                    column = csr_array(
-                        (
-                            amplitudes[chosen],
-                            (rest[chosen], np.zeros(len(chosen), dtype=np.intp)),
-                        ),
-                        shape=(size, 1),
-                    )
-                    result = result + column @ column.conj().T
-                    start = int(stop)
-            return result
+            # One incident photon-number tuple corresponds to one column of B.
+            # Distinct tuples are incoherent after measuring the selected
+            # modes, so the conditional density is B @ B.dag(). Constructing
+            # B in one pass avoids O(number of parents) separate CSR outer
+            # products and repeated CSR additions. The column dimension is
+            # only metadata: no dense (size x number_of_parents) array exists.
+            parent_count = prod(dims[i] for i in modes)
+            columns = csr_array(
+                (amplitudes, (rest, parents)), shape=(size, parent_count)
+            )
+            return columns @ columns.conj().T
 
         entries = data.tocoo(copy=False)
         row_parents = _flat_outcomes(entries.row, dims, modes)
@@ -1543,7 +1534,7 @@ def _dephase_sparse_vector(
         )
     )
     row_counts = np.zeros(size, dtype=np.intp)
-    for start, stop in zip(boundaries[:-1], boundaries[1:]):
+    for start, stop in itertools.pairwise(boundaries):
         row_counts[indices[order[start:stop]]] = stop - start
     indptr = np.empty(size + 1, dtype=np.intp)
     indptr[0] = 0
@@ -1551,7 +1542,7 @@ def _dephase_sparse_vector(
     nnz_out = int(indptr[-1])
     col_indices = np.empty(nnz_out, dtype=np.intp)
     result_data = np.empty(nnz_out, dtype=np.result_type(amplitudes.dtype))
-    for start, stop in zip(boundaries[:-1], boundaries[1:]):
+    for start, stop in itertools.pairwise(boundaries):
         positions = order[start:stop]
         branch_rows = indices[positions]
         branch_amps = amplitudes[positions]

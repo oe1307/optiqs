@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Literal
 
 import numpy as np
@@ -178,6 +179,10 @@ def _wigner_clenshaw(
     diagonals: dict[int, NDArray[np.complex128]],
     a: NDArray[np.complex128],
     z: NDArray[np.float64],
+    evaluate: Callable[
+        [NDArray[np.complex128], int, NDArray[np.float64]],
+        NDArray[np.complex128] | complex,
+    ] = _clenshaw_laguerre,
 ) -> NDArray[np.float64]:
     if not diagonals:
         return np.zeros(a.size, dtype=np.float64)
@@ -189,7 +194,7 @@ def _wigner_clenshaw(
             # Process gaps without evaluating zero-coefficient Laguerre sums.
             for power in range(previous, offset, -1):
                 accumulator = accumulator * (a / math.sqrt(power))
-        accumulator = accumulator + _clenshaw_laguerre(diagonals[offset], offset, z)
+        accumulator = accumulator + evaluate(diagonals[offset], offset, z)
         previous = offset
     if previous is not None:
         for power in range(previous, 0, -1):
@@ -271,6 +276,7 @@ def wigner(
     hbar: float = 1.0,
     method: WignerMethod = "auto",
     chunk_size: int = 32768,
+    accelerator: Literal["numpy", "numba"] = "numpy",
 ) -> NDArray[np.float64]:
     """Compute a one-mode state's Wigner function W(x, p).
 
@@ -291,11 +297,18 @@ def wigner(
     For repeated calculations on the same axes, pass ``WignerGrid(xvec,
     pvec, hbar=...)`` as ``xvec`` to reuse the grid coordinates. In that case
     ``pvec`` must be omitted and ``hbar`` is taken from the grid.
+
+    ``accelerator='numba'`` optionally JIT-compiles the inner Clenshaw
+    recurrence when that method is used (requires ``pip install OptiQS[jit]``).
+    The first call includes compilation overhead. The NumPy default avoids
+    the optional dependency and retains startup performance.
     """
     if not isinstance(state, Qobj):
         raise TypeError("state must be an optiqs.Qobj")
     if method not in ("auto", "clenshaw", "laguerre"):
         raise ValueError("method must be 'auto', 'clenshaw', or 'laguerre'")
+    if accelerator not in ("numpy", "numba"):
+        raise ValueError("accelerator must be 'numpy' or 'numba'")
     if (
         isinstance(chunk_size, bool)
         or not isinstance(chunk_size, int)
@@ -372,6 +385,19 @@ def wigner(
     else:
         pairs = _upper_pairs(coeff, rho)
 
+    # Import Numba only on explicit request and only for the Clenshaw path.
+    # With method='auto', sparse states can still select SciPy Laguerre.
+    evaluator = _clenshaw_laguerre
+    if accelerator == "numba" and diagonals is not None:
+        try:
+            from optiqs.phase_space._wigner_numba import clenshaw_laguerre
+        except ImportError as exc:
+            raise ImportError(
+                "Numba is required for accelerator='numba'; "
+                "install with `pip install OptiQS[jit]`"
+            ) from exc
+        evaluator = clenshaw_laguerre
+
     output = np.zeros((p.size, x.size), dtype=np.float64)
     flat = output.reshape(-1)
     scale = math.sqrt(2.0 / hbar)
@@ -390,7 +416,9 @@ def wigner(
             )
             z = a.real**2 + a.imag**2
         if diagonals is not None:
-            values = np.exp(-0.5 * z) * _wigner_clenshaw(diagonals, a, z)
+            values = np.exp(-0.5 * z) * _wigner_clenshaw(
+                diagonals, a, z, evaluate=evaluator
+            )
         else:
             assert pairs is not None
             values = _wigner_laguerre(pairs, a, z)

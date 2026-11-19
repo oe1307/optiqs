@@ -199,6 +199,63 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
     return output
 
 
+def _sparse_diagonal_support(
+    data: csr_array, dim: int, stride: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Select a cheap occupied-level path, excluding any coherences.
+
+    Unlike the dense-diagonal kernel, this path never creates a vector of
+    length ``data.shape[0]``. Bound the number of generated transitions to
+    avoid materializing a very wide distribution in sparse COO buffers.
+    """
+    if data.nnz == 0 or data.nnz > min(256, max(16, data.shape[0] // 8)):
+        return None
+    entries = data.tocoo(copy=False)
+    active = entries.data != 0
+    if np.any((entries.row != entries.col) & active):
+        return None
+    indices = entries.row[active]
+    if int(np.sum((indices // stride) % dim + 1, dtype=np.int64)) > 250_000:
+        return None
+    return indices, entries.data[active]
+
+
+def _apply_occupied_diagonal_sparse(
+    data: csr_array,
+    dim: int,
+    stride: int,
+    eta: float,
+    indices: np.ndarray,
+    populations: np.ndarray,
+) -> csr_array:
+    """Compute binomial loss transitions from only occupied Fock levels."""
+    dtype = data.dtype if data.dtype.kind in "fc" else np.float64
+    log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+    log_eta = math.log(eta)
+    log_loss = math.log1p(-eta)
+    output_indices: list[np.ndarray] = []
+    output_values: list[np.ndarray] = []
+    for index, population in zip(indices, populations):
+        photons = int((index // stride) % dim)
+        lost = np.arange(photons + 1)
+        log_probs = (
+            log_factorials[photons]
+            - log_factorials[lost]
+            - log_factorials[photons - lost]
+            + (photons - lost) * log_eta
+            + lost * log_loss
+        )
+        output_indices.append(index - lost * stride)
+        output_values.append(population * np.exp(log_probs))
+    if not output_indices:
+        return csr_array(data.shape, dtype=dtype)
+    rows = np.concatenate(output_indices)
+    values = np.concatenate(output_values).astype(dtype, copy=False)
+    # The CSR constructor combines transitions from different parent levels
+    # that end at the same photon number; no repeated Kraus CSR addition.
+    return csr_array((values, (rows, rows)), shape=data.shape)
+
+
 def _apply_diagonal_sparse(
     data: csr_array, dim: int, left: int, right: int, eta: float
 ) -> csr_array:
@@ -380,15 +437,18 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     right = math.prod(dims[mode + 1 :])
     data = density._data
     if isinstance(data, csr_array):
-        result = (
-            _apply_zero_sparse(data, dim, right)
-            if eta == 0
-            else (
-                _apply_diagonal_sparse(data, dim, left, right, float(eta))
-                if _use_diagonal_fast_path(data, dim)
-                else _apply_sparse(data, dim, right, float(eta))
-            )
-        )
+        if eta == 0:
+            result = _apply_zero_sparse(data, dim, right)
+        else:
+            support = _sparse_diagonal_support(data, dim, right)
+            if support is not None:
+                result = _apply_occupied_diagonal_sparse(
+                    data, dim, right, float(eta), *support
+                )
+            elif _use_diagonal_fast_path(data, dim):
+                result = _apply_diagonal_sparse(data, dim, left, right, float(eta))
+            else:
+                result = _apply_sparse(data, dim, right, float(eta))
     elif isinstance(data, np.ndarray):
         result = (
             _apply_zero_dense_numpy(data, dim, left, right)
@@ -401,4 +461,6 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
             if eta == 0
             else _apply_dense_torch(data, dim, left, right, float(eta))
         )
-    return Qobj(result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
+    return Qobj._from_owned_data(
+        result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol
+    )

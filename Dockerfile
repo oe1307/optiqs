@@ -7,7 +7,7 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY optiqs/ ./optiqs/
 
 RUN python -m pip install --only-binary=:all: --no-compile .

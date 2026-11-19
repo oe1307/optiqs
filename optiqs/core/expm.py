@@ -103,7 +103,7 @@ class Expm:
         # a real generator does not unnecessarily become complex-valued.
         # Numeric ABCs (and NumPy's base number type) do not statically
         # promise __complex__, although accepted scalar instances support it.
-        scalar = complex(cast(Union[float, complex], scale))
+        scalar = complex(cast(float | complex, scale))
         if not (math.isfinite(scalar.real) and math.isfinite(scalar.imag)):
             raise ValueError("scale must be finite")
         factor: float | complex = scalar.real if scalar.imag == 0 else scalar

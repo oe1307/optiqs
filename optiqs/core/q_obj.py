@@ -120,6 +120,65 @@ class Qobj:
         self._dims = dims
         self._tol = tol
 
+    @classmethod
+    def _from_owned_data(
+        cls,
+        data: np.ndarray | sp.sparse.csr_array | torch.Tensor,
+        *,
+        dims: tuple[tuple[int, ...], tuple[int, ...]],
+        qtype: Qtype,
+        tol: float,
+    ) -> Qobj:
+        """Adopt a freshly computed, unaliased internal result without copying.
+
+        This is *not* a constructor for caller-provided arrays, views of
+        existing state data or buffers shared with other Qobjs. External
+        callers must use ``Qobj(...)``, which defensively copies its input.
+        As in the regular constructor, CSR entries are canonicalized and
+        pruned according to ``tol`` before the object becomes visible.
+        """
+        if not math.isfinite(tol) or tol < 0:
+            raise ValueError("tol must be a finite non-negative number")
+        if data.ndim != 2:
+            raise ValueError("Data must be a 2D array")
+        if (
+            any(
+                not isinstance(d, int) or isinstance(d, bool) or d <= 0
+                for side in dims
+                for d in side
+            )
+            or not dims[0]
+            or not dims[1]
+        ):
+            raise ValueError("dims must contain positive subsystem dimensions")
+        if math.prod(dims[0]) != data.shape[0] or math.prod(dims[1]) != data.shape[1]:
+            raise ValueError(f"dims {dims} are incompatible with shape {data.shape}")
+        if not isinstance(qtype, Qtype):
+            raise TypeError("qtype must be a Qtype")
+        if qtype == Qtype.ket and data.shape[1] != 1:
+            raise ValueError("A ket must have exactly one column")
+        if qtype == Qtype.bra and data.shape[0] != 1:
+            raise ValueError("A bra must have exactly one row")
+        if isinstance(data, sp.sparse.csr_array):
+            data.sum_duplicates()
+            if data.dtype.kind != "i":
+                data.data[np.abs(data.data) < tol] = 0
+            elif tol > 1:
+                data.data[np.abs(data.data.astype(np.float64)) < tol] = 0
+            data.eliminate_zeros()
+        elif not isinstance(data, np.ndarray):
+            import torch
+
+            if not isinstance(data, torch.Tensor) or data.layout != torch.strided:
+                raise TypeError("Expected a dense NumPy/Torch array or SciPy CSR")
+
+        owned = cls.__new__(cls)
+        owned._data = data
+        owned._dims = dims
+        owned._qtype = qtype
+        owned._tol = tol
+        return owned
+
     @property
     def dims(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         return self._dims
@@ -544,7 +603,9 @@ class Qobj:
         else:
             qtype = Qtype.oper
 
-        return Qobj(result, dims=dims, qtype=qtype, tol=max(self._tol, other._tol))
+        return Qobj._from_owned_data(
+            result, dims=dims, qtype=qtype, tol=max(self._tol, other._tol)
+        )
 
     def __mul__(self, other: object) -> Qobj | NotImplementedType:
         if isinstance(other, Qobj):

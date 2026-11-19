@@ -99,7 +99,7 @@ def _apply_dense_rows(
             .permute(inverse)
             .reshape(data.shape)
         )
-    return Qobj(
+    return Qobj._from_owned_data(
         output,
         dims=state.dims,
         qtype=state.qtype,
@@ -213,7 +213,7 @@ def _apply_sparse_rows(
         cast(Any, (result_coo.data, (restored_rows, restored_cols))),
         shape=source.shape,
     )
-    return Qobj(
+    return Qobj._from_owned_data(
         restored,
         dims=state.dims,
         qtype=state.qtype,

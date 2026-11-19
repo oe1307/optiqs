@@ -366,19 +366,54 @@ def homodyne_probabilities_angles(
     else:
         density = prepared.density
         assert density is not None
-        phase = np.exp(1j * angles[:, None] * indices[None, :])
-        for start in range(0, x.size, batch_size):
-            stop = min(start + batch_size, x.size)
-            basis = _hermite_basis(x[start:stop], cutoff, hbar)
-            for i in range(angles.size):
-                rotated = phase[i, :, None] * basis
-                applied = density @ rotated
-                results[i, start:stop] = (
-                    np.real(
-                        np.einsum("ij,ij->j", rotated.conj(), applied, optimize=False)
+        if isinstance(density, np.ndarray) and angles.size >= 8 and cutoff >= 8:
+            # Dense mixed state: collect each upper diagonal of rho into an
+            # angular Fourier coefficient C_d(x). The Hermitian lower half
+            # contributes its complex conjugate, giving
+            # p(x, theta) = (C_0 + 2 Re(sum_{d>0} e^{id theta} C_d)) / Tr(rho).
+            # Building the coefficients is O(cutoff**2 * points); each angle
+            # then costs only O(cutoff * points), instead of a full rho @ psi.
+            # For few angles or CSR matrices, retain the original contraction.
+            phases = np.exp(1j * angles[:, None] * indices[None, 1:])
+            for start in range(0, x.size, batch_size):
+                stop = min(start + batch_size, x.size)
+                basis = _hermite_basis(x[start:stop], cutoff, hbar)
+                fourier = np.empty((cutoff, stop - start), dtype=np.complex128)
+                for offset in range(cutoff):
+                    diagonal = np.diagonal(density, offset=offset)
+                    if offset:
+                        # Hermiticity is validated with a tolerance. Average
+                        # the two off-diagonals so tiny accepted asymmetries
+                        # still agree with the original real-valued contraction.
+                        diagonal = (
+                            diagonal + np.diagonal(density, offset=-offset).conj()
+                        ) * 0.5
+                    fourier[offset] = np.einsum(
+                        "n,nx,nx->x",
+                        diagonal,
+                        basis[: cutoff - offset],
+                        basis[offset:],
+                        optimize=False,
                     )
-                    / prepared.trace
-                )
+                results[:, start:stop] = (
+                    fourier[0].real[None, :] + 2.0 * (phases @ fourier[1:]).real
+                ) / prepared.trace
+        else:
+            phase = np.exp(1j * angles[:, None] * indices[None, :])
+            for start in range(0, x.size, batch_size):
+                stop = min(start + batch_size, x.size)
+                basis = _hermite_basis(x[start:stop], cutoff, hbar)
+                for i in range(angles.size):
+                    rotated = phase[i, :, None] * basis
+                    applied = density @ rotated
+                    results[i, start:stop] = (
+                        np.real(
+                            np.einsum(
+                                "ij,ij->j", rotated.conj(), applied, optimize=False
+                            )
+                        )
+                        / prepared.trace
+                    )
     return _nonnegative_pdf(results)
 
 

@@ -1,24 +1,45 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "OptiQS"
 version = "0.1.0"
+description = "Efficient, low-memory simulation of photonic quantum systems"
+readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["numpy", "scipy"]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+]
 
-[tool.setuptools.package-dir]
-optiqs = "optiqs"
+[project.optional-dependencies]
+torch = ["torch"]
+jit = ["numba>=0.59"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "pyright",
+    "mypy",
+    "torch",
+    "scipy-stubs; python_version >= '3.12'",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["optiqs*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 optiqs = ["py.typed"]
 
-[project.optional-dependencies]
-gpu = ["torch"]
-dev = [
-    "mypy",
-    "scipy-stubs; python_version >= '3.10'",
-    "pytest",
-    "torch"
-]
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.pyright]
+include = ["optiqs"]
