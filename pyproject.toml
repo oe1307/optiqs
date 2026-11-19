@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "OptiQS"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = ["numpy", "scipy"]
 
 [tool.setuptools.package-dir]
@@ -16,4 +16,9 @@ optiqs = ["py.typed"]
 
 [project.optional-dependencies]
 gpu = ["torch"]
-dev = ["mypy", "scipy-stubs", "pytest", "torch"]
+dev = [
+    "mypy",
+    "scipy-stubs; python_version >= '3.10'",
+    "pytest",
+    "torch"
+]

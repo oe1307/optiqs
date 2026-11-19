@@ -10,22 +10,22 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from numbers import Number
-from types import NotImplementedType
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Union, cast
 
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import expm_multiply
 
+from optiqs._compat import NotImplementedType
 from optiqs.core.q_obj import Qobj, Qtype
 
 # Qobj normalizes SciPy sparse inputs to CSR.  Avoid annotating the stored
 # generator as `sparray`: scipy-stubs does not expose shape, dtype, transpose,
 # etc. on that abstract class, though it supports those on concrete CSR arrays.
 if TYPE_CHECKING:
-    _MatrixData: TypeAlias = np.ndarray | sparse.csr_array[Any, tuple[int, int]]
+    _MatrixData = Union[np.ndarray, sparse.csr_array[Any, tuple[int, int]]]
 else:
-    _MatrixData: TypeAlias = np.ndarray | sparse.csr_array
+    _MatrixData = Union[np.ndarray, sparse.csr_array]
 
 
 def _transpose(data: _MatrixData) -> _MatrixData:
@@ -103,7 +103,7 @@ class Expm:
         # a real generator does not unnecessarily become complex-valued.
         # Numeric ABCs (and NumPy's base number type) do not statically
         # promise __complex__, although accepted scalar instances support it.
-        scalar = complex(cast(float | complex, scale))
+        scalar = complex(cast(Union[float, complex], scale))
         if not (math.isfinite(scalar.real) and math.isfinite(scalar.imag)):
             raise ValueError("scale must be finite")
         factor: float | complex = scalar.real if scalar.imag == 0 else scalar

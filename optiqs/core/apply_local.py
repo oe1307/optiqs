@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from numbers import Integral
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Union, cast
 
 import numpy as np
 from scipy import sparse
@@ -17,7 +17,7 @@ from optiqs.core.q_obj import Qobj, Qtype
 if TYPE_CHECKING:
     from torch import Tensor
 
-LocalGate = Qobj | Expm | LazyCachedOperator
+LocalGate = Union[Qobj, Expm, LazyCachedOperator]
 
 
 def _selected_modes(modes: int | Sequence[int], count: int) -> tuple[int, ...]:

@@ -5,13 +5,13 @@ from collections.abc import Sequence
 from enum import Enum
 from numbers import Integral, Number
 from os import PathLike
-from types import NotImplementedType
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import scipy as sp
 from numpy.typing import DTypeLike
 
+from optiqs._compat import NotImplementedType
 from optiqs.utils import _to_numpy_dtype, get_device
 
 if TYPE_CHECKING:

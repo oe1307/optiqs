@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 from numpy.typing import DTypeLike
 from scipy.sparse import csr_array

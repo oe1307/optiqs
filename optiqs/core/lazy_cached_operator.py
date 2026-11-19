@@ -20,22 +20,22 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
 from threading import RLock
-from types import NotImplementedType
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Union, cast
 
 import numpy as np
 from scipy import sparse
 from scipy.linalg import expm
 from scipy.sparse.linalg import expm_multiply
 
+from optiqs._compat import NotImplementedType
 from optiqs.core.expm import Expm
 from optiqs.core.q_obj import Qobj, Qtype
 
 # Use a concrete two-dimensional CSR type for SciPy stub compatibility.
 if TYPE_CHECKING:
-    _MatrixData: TypeAlias = np.ndarray | sparse.csr_array[Any, tuple[int, int]]
+    _MatrixData = Union[np.ndarray, sparse.csr_array[Any, tuple[int, int]]]
 else:
-    _MatrixData: TypeAlias = np.ndarray | sparse.csr_array
+    _MatrixData = Union[np.ndarray, sparse.csr_array]
 
 
 @dataclass(frozen=True)

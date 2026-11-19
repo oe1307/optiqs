@@ -12,7 +12,6 @@ It does NOT mean predicting a random single-shot photon count.
 
 from __future__ import annotations
 
-import itertools
 from collections.abc import Sequence
 from functools import lru_cache
 from math import isfinite, log, log1p, prod, sqrt
@@ -1501,7 +1500,7 @@ def _dephase_sparse_vector(
         )
     )
     row_counts = np.zeros(size, dtype=np.intp)
-    for start, stop in itertools.pairwise(boundaries):
+    for start, stop in zip(boundaries[:-1], boundaries[1:]):
         row_counts[indices[order[start:stop]]] = stop - start
     indptr = np.empty(size + 1, dtype=np.intp)
     indptr[0] = 0
@@ -1509,7 +1508,7 @@ def _dephase_sparse_vector(
     nnz_out = int(indptr[-1])
     col_indices = np.empty(nnz_out, dtype=np.intp)
     result_data = np.empty(nnz_out, dtype=np.result_type(amplitudes.dtype))
-    for start, stop in itertools.pairwise(boundaries):
+    for start, stop in zip(boundaries[:-1], boundaries[1:]):
         positions = order[start:stop]
         branch_rows = indices[positions]
         branch_amps = amplitudes[positions]
