@@ -1,8 +1,8 @@
 """Exact bosonic photon-loss (pure-loss) channel in the Fock basis.
 
-The channel acts directly on a ``Qobj`` density matrix, without forming
-an environment, beam-splitter unitary, or a Liouville-space superoperator.
-For a sparse input it never densifies the matrix.
+The channel acts directly on a ``Qobj`` density matrix or on the Kraus
+images of a ket/bra, without forming an environment, beam-splitter unitary,
+or a Liouville-space superoperator. Sparse inputs are never densified.
 """
 
 from __future__ import annotations
@@ -449,6 +449,178 @@ def _apply_dense_torch(
     return result.reshape(data.shape)
 
 
+def _apply_vector_dense_numpy(
+    data: np.ndarray, dim: int, left: int, right: int, eta: float, *, bra: bool
+) -> np.ndarray:
+    """Pure-state Kraus columns, avoiding the intermediate D-by-D density."""
+    ket = data.conj().T if bra else data
+    if ket.dtype.kind not in "fc":
+        ket = ket.astype(np.float64)
+    elif ket.dtype == np.float16:
+        ket = ket.astype(np.float32)
+
+    norm = np.linalg.norm(ket)
+    if norm == 0 or not np.isfinite(norm):
+        raise ValueError("Cannot normalize an object with zero or invalid norm")
+    psi = (ket / norm).reshape(left, dim, right)
+    total = left * dim * right
+
+    if eta == 0.0:
+        # The lost mode is vacuum in the output. Trace it out directly from
+        # the normalized ket, without allocating a Kraus matrix or its dm().
+        environment = psi.transpose(1, 0, 2).reshape(dim, left * right)
+        reduced = environment.T @ environment.conj()
+        result = np.zeros((total, total), dtype=psi.dtype)
+        result.reshape(left, dim, right, left, dim, right)[:, 0, :, :, 0, :] = (
+            reduced.reshape(left, right, left, right)
+        )
+        return result
+
+    log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+    weight_dtype = np.float32 if psi.dtype in (np.float32, np.complex64) else np.float64
+    # Contiguous Kraus rows make each slice assignment a view; the last
+    # operation is a BLAS matrix multiplication on a (dim, D) buffer.
+    columns = np.zeros((dim, total), dtype=psi.dtype)
+    for lost in range(dim):
+        weights = _jump_amplitudes(dim, lost, eta, log_factorials).astype(
+            weight_dtype, copy=False
+        )
+        columns[lost].reshape(left, dim, right)[:, : dim - lost, :] = (
+            psi[:, lost:, :] * weights[None, :, None]
+        )
+    return columns.T @ columns.conj()
+
+
+def _apply_vector_sparse(
+    data: csr_array, dim: int, stride: int, eta: float, *, bra: bool
+) -> csr_array:
+    """Use a sparse D-by-dim Kraus matrix, not a sparse D-by-D ket dm().
+
+    Transition coordinates are generated in bounded batches. Accumulating
+    the (still sparse) Kraus columns limits temporary COO allocations for
+    vectors with large Fock-number support.
+    """
+    entries = data.tocoo(copy=False)
+    positions = entries.col if bra else entries.row
+    amplitudes = entries.data.conj() if bra else entries.data
+    if amplitudes.dtype.kind not in "fc":
+        amplitudes = amplitudes.astype(np.float64)
+    elif amplitudes.dtype == np.float16:
+        amplitudes = amplitudes.astype(np.float32)
+
+    norm = np.linalg.norm(amplitudes)
+    if norm == 0 or not np.isfinite(norm):
+        raise ValueError("Cannot normalize an object with zero or invalid norm")
+    amplitudes = amplitudes / norm
+    photons = (positions // stride) % dim
+    total = max(data.shape)
+    output_dtype = amplitudes.dtype
+
+    if eta == 0.0:
+        # Each coefficient loses all photons in the selected mode.
+        columns = csr_array(
+            (amplitudes, (positions - photons * stride, photons)),
+            shape=(total, dim),
+        )
+    else:
+        counts = np.asarray(photons + 1, dtype=np.int64)
+        cumulative = np.cumsum(counts, dtype=np.int64)
+        log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+        log_eta, log_loss = math.log(eta), math.log1p(-eta)
+        weight_dtype = (
+            np.float32 if output_dtype in (np.float32, np.complex64) else np.float64
+        )
+        columns = csr_array((total, dim), dtype=output_dtype)
+        start = 0
+        while start < positions.size:
+            previous = int(cumulative[start - 1]) if start else 0
+            stop = max(
+                start + 1,
+                int(
+                    np.searchsorted(
+                        cumulative,
+                        previous + _SPARSE_LOSS_BATCH_MAX_ENTRIES,
+                        side="right",
+                    )
+                ),
+            )
+            sizes = counts[start:stop]
+            parents = np.repeat(np.arange(start, stop, dtype=np.intp), sizes)
+            offsets = np.repeat(np.cumsum(sizes, dtype=np.int64) - sizes, sizes)
+            lost = np.arange(parents.size, dtype=np.int64) - offsets
+            n = photons[parents]
+            log_prob = (
+                log_factorials[n]
+                - log_factorials[lost]
+                - log_factorials[n - lost]
+                + (n - lost) * log_eta
+                + lost * log_loss
+            )
+            weights = np.exp(0.5 * log_prob).astype(weight_dtype, copy=False)
+            values = amplitudes[parents] * weights
+            nonzero = values != 0
+            if np.any(nonzero):
+                partial = csr_array(
+                    (
+                        values[nonzero],
+                        (
+                            positions[parents[nonzero]] - lost[nonzero] * stride,
+                            lost[nonzero],
+                        ),
+                    ),
+                    shape=(total, dim),
+                )
+                columns = columns + partial
+            start = stop
+
+    return csr_array(columns @ columns.conj().T)
+
+
+def _apply_vector_dense_torch(
+    data: torch.Tensor, dim: int, left: int, right: int, eta: float, *, bra: bool
+) -> torch.Tensor:
+    """Compute ket/bra Kraus columns on device while retaining autograd."""
+    import torch
+
+    ket = data.conj().T if bra else data
+    if not (ket.is_floating_point() or ket.is_complex()):
+        ket = ket.to(dtype=torch.get_default_dtype())
+    elif ket.dtype in (torch.float16, torch.bfloat16):
+        ket = ket.to(dtype=torch.float32)
+
+    norm = torch.linalg.vector_norm(ket)
+    if not torch.isfinite(norm).item() or norm.abs().item() == 0:
+        raise ValueError("Cannot normalize an object with zero or invalid norm")
+    psi = (ket / norm).reshape(left, dim, right)
+    total = left * dim * right
+
+    if eta == 0.0:
+        environment = psi.permute(1, 0, 2).reshape(dim, left * right)
+        reduced = environment.T @ environment.conj()
+        result = torch.zeros((total, total), dtype=psi.dtype, device=psi.device)
+        result.reshape(left, dim, right, left, dim, right)[:, 0, :, :, 0, :] = (
+            reduced.reshape(left, right, left, right)
+        )
+        return result
+
+    log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+    weights = np.zeros((dim, dim), dtype=np.float64)
+    for lost in range(dim):
+        weights[lost, lost:] = _jump_amplitudes(dim, lost, eta, log_factorials)
+    real_dtype = (
+        torch.float64
+        if psi.dtype in (torch.float64, torch.complex128)
+        else torch.float32
+    )
+    weights_device = torch.as_tensor(weights, dtype=real_dtype, device=psi.device)
+    columns = torch.zeros((dim, total), dtype=psi.dtype, device=psi.device)
+    for lost in range(dim):
+        columns[lost].reshape(left, dim, right)[:, : dim - lost, :] = (
+            psi[:, lost:, :] * weights_device[lost, lost:][None, :, None]
+        )
+    return columns.T @ columns.conj()
+
+
 def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     """Apply the exact independent-environment pure-loss channel to one mode.
 
@@ -464,8 +636,8 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     Parameters
     ----------
     state : Qobj
-        A ket, bra, or square density operator. For a ket/bra, ``dm()`` is
-        used first (which normalizes the input, as elsewhere in OptiQS).
+        A ket, bra, or square density operator. Ket/bra inputs are normalized
+        and processed directly via Kraus columns instead of forming ``dm()``.
     eta : float
         Power transmissivity in [0, 1]; 1 = no loss, 0 = complete loss.
     mode : int, optional
@@ -482,8 +654,10 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     -----
     Operates directly on Fock-index slices/shifts, without a large
     beam-splitter or superoperator. The work for a dense D x D matrix is
-    O(dim * D**2), using O(D**2) output memory; for CSR, only occupied
-    matrix entries are processed and no dense D x D matrix is allocated.
+    O(dim * D**2), using O(D**2) output memory; pure states first create
+    a D-by-dim Kraus buffer instead of a D-by-D input density matrix. For
+    CSR, only occupied entries are processed and no dense D x D matrix is
+    allocated.
 
     Requires a valid physical input density operator. As usual, the Fock
     cutoff must already be high enough to represent the initial state.
@@ -503,13 +677,33 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     if state.qtype == Qtype.oper and state.dims[0] != state.dims[1]:
         raise ValueError("density operator must have matching subsystem dimensions")
 
-    density = state.dm() if state.is_vector() else state
     if eta == 1:
-        return density.copy()
+        # Keep the exact original dtype/normalization semantics for no loss.
+        return (state.dm() if state.is_vector() else state).copy()
 
     dim = dims[mode]
     left = math.prod(dims[:mode])
     right = math.prod(dims[mode + 1 :])
+    if state.is_vector():
+        vector_data = state._data
+        is_bra = state.qtype == Qtype.bra
+        if isinstance(vector_data, csr_array):
+            result = _apply_vector_sparse(
+                vector_data, dim, right, float(eta), bra=is_bra
+            )
+        elif isinstance(vector_data, np.ndarray):
+            result = _apply_vector_dense_numpy(
+                vector_data, dim, left, right, float(eta), bra=is_bra
+            )
+        else:
+            result = _apply_vector_dense_torch(
+                vector_data, dim, left, right, float(eta), bra=is_bra
+            )
+        return Qobj._from_owned_data(
+            result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol
+        )
+
+    density = state
     data = density._data
     if isinstance(data, csr_array):
         if eta == 0:

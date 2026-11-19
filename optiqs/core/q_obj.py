@@ -1027,14 +1027,26 @@ class Qobj:
             )
 
         elif isinstance(data, np.ndarray):
-            tensor = data.reshape(subsystems + subsystems)
-            n = len(subsystems)
-
-            for i in reversed(traced):
-                tensor = np.trace(tensor, axis1=i, axis2=i + n)
-                n -= 1
-
-            result = tensor.reshape(out_size, out_size)
+            if not traced:
+                # The constructor below makes the independent copy required
+                # by ptrace; avoid an unnecessary einsum of the full tensor.
+                result = data
+            else:
+                # Pair each traced mode's row/column indices in a single
+                # contraction. Repeated np.trace calls can materialize large
+                # intermediate tensors when only a few modes are retained.
+                n = len(subsystems)
+                keep_set = set(kept)
+                input_labels = list(range(n)) + [
+                    n + i if i in keep_set else i for i in range(n)
+                ]
+                output_labels = list(kept) + [n + i for i in kept]
+                result = np.einsum(
+                    data.reshape(subsystems + subsystems),
+                    input_labels,
+                    output_labels,
+                    optimize=False,
+                ).reshape(out_size, out_size)
 
         else:
             import torch
