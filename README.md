@@ -11,6 +11,16 @@
   <img src="https://img.shields.io/github/languages/code-size/oe1307/optiqs?logo=github&logoColor=white">
 </div>
 
+## Features
+
+| Category                   | Supported Features                                                                |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| **Quantum States**         | Fock, Coherent, Cat, Approximate GKP, Rotational Cat, Rotation-Symmetric Binomial |
+| **Optical Operations**     | Beam Splitter, Displacement, Squeezing, Phase Shift                               |
+| **Measurements**           | Photon Number (PNRD), Joint PNRD, Homodyne, Post-selection                        |
+| **Noise Models**           | Photon Loss                                                                       |
+| **Analysis Tools**         | Wigner Function, Fidelity, Expectation Value, Variance, Partial Trace             |
+| **Computational Backends** | Sparse Matrices, Lazy/Cached Operators, PyTorch GPU Support (Dense Tensors)       |
 
 ## Setup
 
