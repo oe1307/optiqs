@@ -1,4 +1,5 @@
 from optiqs.core.apply_local import apply_local
+from optiqs.core.expect import expect, variance
 from optiqs.core.expm import Expm
 from optiqs.core.fidelity import fidelity
 from optiqs.core.io import load_state, save_state
@@ -12,8 +13,10 @@ __all__ = [
     "LazyCachedOperator",
     "Qobj",
     "apply_local",
+    "expect",
     "fidelity",
     "load_state",
     "save_state",
     "tensor",
+    "variance",
 ]

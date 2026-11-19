@@ -5,10 +5,12 @@ from optiqs.core import (
     LazyCacheInfo,
     Qobj,
     apply_local,
+    expect,
     fidelity,
     load_state,
     save_state,
     tensor,
+    variance,
 )
 from optiqs.measurements import (
     homodyne_probabilities,
@@ -70,6 +72,7 @@ __all__ = [
     "destroy",
     "disp",
     "displace",
+    "expect",
     "fidelity",
     "fock",
     "get_device",
@@ -104,5 +107,6 @@ __all__ = [
     "squeeze",
     "tensor",
     "vacuum",
+    "variance",
     "wigner",
 ]
