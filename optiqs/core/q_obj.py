@@ -735,12 +735,10 @@ class Qobj:
 
     def copy(self) -> Qobj:
         """Create a copy of the quantum state."""
-        if isinstance(self._data, (np.ndarray, sp.sparse.csr_array)):
-            return Qobj(
-                self._data.copy(), dims=self.dims, tol=self._tol, qtype=self.qtype
-            )
-
-        return Qobj(self._data.clone(), dims=self.dims, tol=self._tol, qtype=self.qtype)
+        # Qobj.__init__ always copies NumPy/CSR inputs (and clones torch
+        # tensors), so copying here would allocate an unnecessary second
+        # full-size buffer. Keep the constructor as the single copy boundary.
+        return Qobj(self._data, dims=self.dims, tol=self._tol, qtype=self.qtype)
 
     def dag(self) -> Qobj:
         """Hermitian conjugate of the state"""

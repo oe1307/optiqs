@@ -160,6 +160,23 @@ def _vacuum_wavefunction(x: NDArray[np.float64], hbar: float) -> NDArray[np.floa
     return np.exp(-0.5 * z * z) / (math.pi * hbar) ** 0.25
 
 
+def _hermite_basis(
+    x: NDArray[np.float64], cutoff: int, hbar: float
+) -> NDArray[np.float64]:
+    """Evaluate Fock wavefunctions once for a chunk of quadrature points."""
+    abscissa = x / math.sqrt(hbar)
+    basis = np.empty((cutoff, x.size), dtype=np.float64)
+    basis[0] = _vacuum_wavefunction(x, hbar)
+    if cutoff > 1:
+        basis[1] = math.sqrt(2.0) * abscissa * basis[0]
+    for n in range(1, cutoff - 1):
+        basis[n + 1] = (
+            math.sqrt(2.0 / (n + 1)) * abscissa * basis[n]
+            - math.sqrt(n / (n + 1)) * basis[n - 1]
+        )
+    return basis
+
+
 def _pure_pdf(
     coefficients: NDArray[np.complex128],
     x: NDArray[np.float64],
@@ -209,16 +226,7 @@ def _mixed_pdf(
     batch_size = max(1, min(chunk_size, 1_000_000 // cutoff))
     for start in range(0, x.size, batch_size):
         stop = min(start + batch_size, x.size)
-        abscissa = x[start:stop] / math.sqrt(hbar)
-        basis = np.empty((cutoff, stop - start), dtype=np.float64)
-        basis[0] = _vacuum_wavefunction(x[start:stop], hbar)
-        if cutoff > 1:
-            basis[1] = math.sqrt(2.0) * abscissa * basis[0]
-        for n in range(1, cutoff - 1):
-            basis[n + 1] = (
-                math.sqrt(2.0 / (n + 1)) * abscissa * basis[n]
-                - math.sqrt(n / (n + 1)) * basis[n - 1]
-            )
+        basis = _hermite_basis(x[start:stop], cutoff, hbar)
         rotated = basis if phase is None else phase[:, None] * basis
         result = density @ rotated
         out[start:stop] = (
@@ -226,6 +234,18 @@ def _mixed_pdf(
             / trace
         )
     return out
+
+
+def _nonnegative_pdf(result: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Apply the same numerical checks to single- and multi-angle PDFs."""
+    if not np.all(np.isfinite(result)):
+        raise ValueError("homodyne probability density is not finite")
+    # Small roundoff-induced negative values can arise from an otherwise
+    # physical, Hermitian mixed state near a zero of the distribution.
+    tolerance = 128 * np.finfo(np.float64).eps * float(np.max(np.abs(result)))
+    if np.any(result < -tolerance):
+        raise ValueError("homodyne probability density must be nonnegative")
+    return np.maximum(result, 0.0)
 
 
 def _pdf(
@@ -248,14 +268,7 @@ def _pdf(
             hbar,
             chunk_size,
         )
-    if not np.all(np.isfinite(result)):
-        raise ValueError("homodyne probability density is not finite")
-    # Small roundoff-induced negative values can arise from an otherwise
-    # physical, Hermitian mixed state near a zero of the distribution.
-    tolerance = 128 * np.finfo(np.float64).eps * float(np.max(np.abs(result)))
-    if np.any(result < -tolerance):
-        raise ValueError("homodyne probability density must be nonnegative")
-    return np.maximum(result, 0.0)
+    return _nonnegative_pdf(result)
 
 
 def homodyne_probabilities(
@@ -295,6 +308,78 @@ def homodyne_probabilities(
     x = _points(xvec)
     prepared = _prepare(state, mode)
     return _pdf(prepared, x, theta, hbar, chunk_size)
+
+
+def homodyne_probabilities_angles(
+    state: Qobj,
+    xvec: ArrayLike,
+    thetas: ArrayLike,
+    mode: int = 0,
+    *,
+    hbar: float = 1.0,
+    chunk_size: int = 4096,
+) -> NDArray[np.float64]:
+    """Evaluate homodyne PDFs at many angles, sharing the Hermite basis.
+
+    Returns an array of shape ``(len(thetas), len(xvec))``, in the order
+    supplied. Unlike repeatedly calling ``homodyne_probabilities``, the
+    reduced state and the Fock wavefunctions for each x-chunk are computed
+    only once.  Memory usage is bounded by ``cutoff * batch_size`` plus the
+    final output and the angle-dependent coefficients.  All inputs are
+    validated as for the single-angle API.
+    """
+    if np.iscomplexobj(thetas):
+        raise ValueError("thetas must contain finite real numbers")
+    try:
+        raw_angles = np.asarray(thetas)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("thetas must be a 1-D sequence of real numbers") from exc
+    if raw_angles.ndim != 1 or raw_angles.size == 0:
+        raise ValueError("thetas must be a nonempty 1-D sequence")
+    angles = np.asarray(
+        [
+            math.remainder(_real_parameter(value, "theta"), 2 * math.pi)
+            for value in raw_angles
+        ],
+        dtype=np.float64,
+    )
+    hbar = _real_parameter(hbar, "hbar", positive=True)
+    chunk_size = _positive_integer(chunk_size, "chunk_size")
+    x = _points(xvec)
+    prepared = _prepare(state, mode)
+    cutoff = prepared.cutoff
+    indices = np.arange(cutoff, dtype=np.float64)
+    results = np.empty((angles.size, x.size), dtype=np.float64)
+    batch_size = max(1, min(chunk_size, 1_000_000 // cutoff))
+
+    # Keep each representation's entire computation in one branch.  This
+    # guarantees that coefficients, phase, and density are initialized on the
+    # paths where they are used (including for static type checkers).
+    if prepared.coefficients is not None:
+        coefficients = prepared.coefficients[None, :] * np.exp(
+            -1j * angles[:, None] * indices[None, :]
+        )
+        for start in range(0, x.size, batch_size):
+            stop = min(start + batch_size, x.size)
+            basis = _hermite_basis(x[start:stop], cutoff, hbar)
+            results[:, start:stop] = np.abs(coefficients @ basis) ** 2
+    else:
+        density = prepared.density
+        assert density is not None
+        phase = np.exp(1j * angles[:, None] * indices[None, :])
+        for start in range(0, x.size, batch_size):
+            stop = min(start + batch_size, x.size)
+            basis = _hermite_basis(x[start:stop], cutoff, hbar)
+            for i in range(angles.size):
+                rotated = phase[i, :, None] * basis
+                applied = density @ rotated
+                results[i, start:stop] = (
+                    np.real(
+                        np.einsum("ij,ij->j", rotated.conj(), applied, optimize=False)
+                    )
+                    / prepared.trace
+                )
+    return _nonnegative_pdf(results)
 
 
 def measure_homodyne(
@@ -365,4 +450,8 @@ def measure_homodyne(
     return float(samples[0]) if shots == 1 else samples
 
 
-__all__ = ["homodyne_probabilities", "measure_homodyne"]
+__all__ = [
+    "homodyne_probabilities",
+    "homodyne_probabilities_angles",
+    "measure_homodyne",
+]

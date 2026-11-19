@@ -12,7 +12,7 @@ It does NOT mean predicting a random single-shot photon count.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from functools import lru_cache
 from math import isfinite, log, log1p, prod, sqrt
 from numbers import Integral, Real
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     import torch
 
 __all__ = [
+    "iter_joint_photon_number_branches",
     "joint_photon_number_branches",
     "joint_photon_number_probabilities",
     "measure_joint_nonselective",
@@ -148,14 +149,23 @@ def _loss_kernel(dim: int, eta: float) -> np.ndarray:
 
 
 def _loss_parent_weights(
-    dims: tuple[int, ...], modes: tuple[int, ...], outcomes: tuple[int, ...], eta: float
+    dims: tuple[int, ...],
+    modes: tuple[int, ...],
+    outcomes: tuple[int, ...],
+    eta: float,
+    kernels: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
     """Probability of one detected tuple conditional on each incident tuple."""
     shape = tuple(dims[mode] for mode in modes)
     weights = np.ones(shape, dtype=np.float64)
     for axis, (mode, outcome) in enumerate(zip(modes, outcomes)):
         axis_shape = (1,) * axis + (dims[mode],) + (1,) * (len(modes) - axis - 1)
-        weights *= _loss_row(dims[mode], outcome, eta).reshape(axis_shape)
+        row = (
+            _loss_row(dims[mode], outcome, eta)
+            if kernels is None
+            else kernels[axis][outcome]
+        )
+        weights *= row.reshape(axis_shape)
     return weights.reshape(-1)
 
 
@@ -1321,10 +1331,10 @@ def measure_joint_photon_number(
     return post_select_joint(state, outcomes, modes, discard=discard, eta=eta)
 
 
-def _sparse_branches(
+def _iter_sparse_branches(
     state: Qobj, dims: tuple[int, ...], modes: tuple[int, ...], discard: bool
-) -> dict[tuple[int, ...], tuple[float, Qobj]]:
-    """Enumerate only occupied sparse outcome bins; scan sparse entries once."""
+) -> Iterator[tuple[tuple[int, ...], tuple[float, Qobj]]]:
+    """Yield occupied sparse outcome bins after a single scan of CSR entries."""
     data = state._data
     assert isinstance(data, csr_array)
     indices, weights = _sparse_basis_weights(state)
@@ -1364,7 +1374,6 @@ def _sparse_branches(
         ordered = candidates[np.argsort(row_bins[candidates], kind="stable")]
         sorted_bins = row_bins[ordered]
 
-    output: dict[tuple[int, ...], tuple[float, Qobj]] = {}
     for packed, weight in zip(unique, raw_by_bin):
         if weight <= 0:
             continue
@@ -1414,11 +1423,13 @@ def _sparse_branches(
                 shape=((output_size, output_size) if discard else data.shape),
             )
         branch = tuple(int(n) for n in np.unravel_index(int(packed), shape))
-        output[branch] = (
-            float(weight / total),
-            Qobj(result, dims=output_dims, qtype=state.qtype, tol=state._tol),
+        yield (
+            branch,
+            (
+                float(weight / total),
+                Qobj(result, dims=output_dims, qtype=state.qtype, tol=state._tol),
+            ),
         )
-    return output
 
 
 def joint_photon_number_branches(
@@ -1439,6 +1450,26 @@ def joint_photon_number_branches(
     many nonzero outcomes and all conditional states are density operators.
     Materializing many conditional states can still be very expensive.
     """
+    return dict(
+        iter_joint_photon_number_branches(state, modes, discard=discard, eta=eta)
+    )
+
+
+def iter_joint_photon_number_branches(
+    state: Qobj,
+    modes: Sequence[int] | None = None,
+    *,
+    discard: bool = False,
+    eta: float = 0.0,
+) -> Iterator[tuple[tuple[int, ...], tuple[float, Qobj]]]:
+    """Yield ``(outcome, (probability, conditional_state))`` lazily.
+
+    Unlike ``joint_photon_number_branches``, this API does not retain all
+    conditional Qobjs.  Its probability distribution or sparse index groups
+    are still prepared once, but each conditional state is constructed only
+    when the iterator advances.  Use it for incremental processing of many
+    measurement branches.  Validation occurs at first iteration.
+    """
     dims, selected = _modes_and_dims(state, modes)
     eta = _loss_probability(eta)
     if not isinstance(discard, bool):
@@ -1447,19 +1478,32 @@ def joint_photon_number_branches(
         raise ValueError("cannot discard every mode; pass discard=False")
     if eta:
         probabilities = joint_photon_number_probabilities(state, selected, eta=eta)
-        lossy_branches: dict[tuple[int, ...], tuple[float, Qobj]] = {}
+        # Avoid computing gammaln/logarithms anew for each detected outcome.
+        # Cap kernels at 1 MiB per mode and avoid allocating a whole kernel
+        # for a single detected outcome.
+        kernels = (
+            tuple(_loss_kernel(dims[mode], eta) for mode in selected)
+            if np.count_nonzero(probabilities) > 1
+            and all(
+                dims[mode] ** 2 * 8 <= _MAX_CACHED_LOSS_KERNEL_BYTES
+                for mode in selected
+            )
+            else None
+        )
         for counts in np.argwhere(probabilities > 0):
             outcome = tuple(int(n) for n in counts)
-            parent_weights = _loss_parent_weights(dims, selected, outcome, eta)
+            parent_weights = _loss_parent_weights(
+                dims, selected, outcome, eta, kernels=kernels
+            )
             projected = _lossy_project_joint(
                 state, dims, selected, outcome, discard, parent_weights
             )
-            lossy_branches[outcome] = (float(probabilities[outcome]), projected)
-        return lossy_branches
+            yield outcome, (float(probabilities[outcome]), projected)
+        return
     if isinstance(state._data, csr_array):
-        return _sparse_branches(state, dims, selected, discard)
+        yield from _iter_sparse_branches(state, dims, selected, discard)
+        return
     probabilities, raw, scale = _normalized_joint_weights(state, dims, selected)
-    branches: dict[tuple[int, ...], tuple[float, Qobj]] = {}
     for counts in np.argwhere(raw > 0):
         outcome = tuple(int(n) for n in counts)
         projected = _project_joint(
@@ -1470,8 +1514,7 @@ def joint_photon_number_branches(
             discard,
             scale,
         )
-        branches[outcome] = (float(probabilities[outcome]), projected)
-    return branches
+        yield outcome, (float(probabilities[outcome]), projected)
 
 
 def _dephase_sparse_vector(

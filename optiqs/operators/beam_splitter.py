@@ -11,7 +11,7 @@ from hashlib import sha256
 from numbers import Real
 from os import PathLike
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import DTypeLike
@@ -29,7 +29,7 @@ def beam_splitter(
     tol: float = 1e-17,
     *,
     lazy: bool = True,
-    precompute: bool = True,
+    precompute: bool | Literal["auto"] = True,
     cache_dir: str | PathLike[str] | None = "~/.cache/optiqs/beam_splitter",
     max_cache_mb: float = 256.0,
 ) -> LazyCachedOperator | Qobj:
@@ -72,12 +72,16 @@ def beam_splitter(
         which processes only touched total-photon-number blocks and caches
         frequently used exponentials. When false, materialize a dense
         ``Qobj`` for the full unitary.
-    precompute : bool, optional
+    precompute : bool or "auto", optional
         If true (default), construct and cache a block-sparse ``Qobj``
         eagerly. This favors repeated uses of the same operator; for a
         one-shot application, ``precompute=False`` can avoid unnecessary
         work. Precomputed results are shared and read-only; call ``.copy()``
         before modifying them. Incompatible with ``lazy=False``.
+        ``"auto"`` returns a state-aware lazy operator: only blocks touched
+        by an input are evaluated, and wide inputs can trigger earlier
+        per-block caching. The default ``True`` is unchanged for backward
+        compatibility.
     cache_dir : str or None, optional
         Directory for persisting precomputed operators. Used only with
         ``precompute=True``; None disables disk caching.
@@ -124,10 +128,11 @@ def beam_splitter(
 
     if not isinstance(lazy, (bool, np.bool_)):
         raise TypeError("lazy must be a boolean")
-    if not isinstance(precompute, (bool, np.bool_)):
-        raise TypeError("precompute must be a boolean")
+    auto = isinstance(precompute, str) and precompute == "auto"
+    if not isinstance(precompute, (bool, np.bool_)) and not auto:
+        raise TypeError('precompute must be a boolean or "auto"')
     if precompute and not lazy:
-        raise ValueError("precompute=True is incompatible with lazy=False")
+        raise ValueError('precompute=True/"auto" is incompatible with lazy=False')
     if (
         isinstance(tol, (bool, np.bool_))
         or not isinstance(tol, Real)
@@ -150,12 +155,21 @@ def beam_splitter(
     if np_dtype.kind == "f" and abs(math.sin(phi)) > 16 * np.finfo(np.float64).eps:
         raise ValueError("a nonzero complex phase requires a complex dtype")
 
-    if precompute:
+    if not auto and precompute:
         return _precomputed_beam_splitter(
             dim_a, dim_b, theta, phi, np_dtype, tol, cache_dir, max_cache_mb
         )
 
-    op = _lazy_beam_splitter(dim_a, dim_b, theta, phi, np_dtype, tol, max_cache_mb)
+    op = _lazy_beam_splitter(
+        dim_a,
+        dim_b,
+        theta,
+        phi,
+        np_dtype,
+        tol,
+        max_cache_mb,
+        adaptive_cache=auto,
+    )
     return op if lazy else op.to_qobj()
 
 
@@ -171,6 +185,8 @@ def _lazy_beam_splitter(
     dtype: np.dtype[Any],
     tol: float,
     max_cache_mb: float,
+    *,
+    adaptive_cache: bool = False,
 ) -> LazyCachedOperator:
     """Build the shared sparse generator and its invariant photon blocks.
 
@@ -226,6 +242,7 @@ def _lazy_beam_splitter(
         scale=theta,
         blocks=blocks,
         max_cache_mb=max_cache_mb,
+        adaptive_cache=adaptive_cache,
     )
 
 

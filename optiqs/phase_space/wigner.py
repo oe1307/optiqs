@@ -29,6 +29,47 @@ def _axis(values: ArrayLike, name: str) -> NDArray[np.float64]:
     return axis
 
 
+class WignerGrid:
+    """Reusable phase-space geometry for repeated Wigner evaluations.
+
+    Construct once with ``WignerGrid(xvec, pvec, hbar=...)`` and pass it as
+    the second argument to ``wigner(state, grid)``.  This opts into storing
+    the grid's complex coordinates and squared radii (approximately 24 bytes
+    per point), avoiding their repeated construction across different states.
+    Large grids can consume significant memory; the ordinary ``wigner`` path
+    remains chunked and does not retain these arrays.
+    """
+
+    def __init__(
+        self, xvec: ArrayLike, pvec: ArrayLike | None = None, *, hbar: float = 1.0
+    ) -> None:
+        self.hbar = _valid_hbar(hbar)
+        self.x = _axis(xvec, "xvec").copy()
+        self.p = self.x if pvec is None else _axis(pvec, "pvec").copy()
+        self.x.flags.writeable = False
+        self.p.flags.writeable = False
+        scale = math.sqrt(2.0 / self.hbar)
+        self._a: NDArray[np.complex128] = np.asarray(
+            scale * (self.x[None, :] + 1j * self.p[:, None]),
+            dtype=np.complex128,
+        ).reshape(-1)
+        self._z: NDArray[np.float64] = self._a.real**2 + self._a.imag**2
+        self._a.flags.writeable = False
+        self._z.flags.writeable = False
+
+
+def _valid_hbar(value: float) -> float:
+    try:
+        if np.iscomplexobj(value):
+            raise TypeError
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("hbar must be a positive finite real number") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError("hbar must be a positive finite real number")
+    return result
+
+
 def _input_data(state: Qobj) -> tuple[NDArray[np.complex128] | sparse.csr_array, bool]:
     """Return a CPU representation without building a ket's density matrix."""
     data = state._data
@@ -224,7 +265,7 @@ def _wigner_laguerre(
 
 def wigner(
     state: Qobj,
-    xvec: ArrayLike,
+    xvec: ArrayLike | WignerGrid,
     pvec: ArrayLike | None = None,
     *,
     hbar: float = 1.0,
@@ -247,6 +288,9 @@ def wigner(
     methods avoid displacement-operator exponentials and, for a pure state,
     avoid materializing its O(dim**2) density matrix.  Processing points
     in chunks limits working memory to O(chunk_size) plus the output.
+    For repeated calculations on the same axes, pass ``WignerGrid(xvec,
+    pvec, hbar=...)`` as ``xvec`` to reuse the grid coordinates. In that case
+    ``pvec`` must be omitted and ``hbar`` is taken from the grid.
     """
     if not isinstance(state, Qobj):
         raise TypeError("state must be an optiqs.Qobj")
@@ -258,17 +302,19 @@ def wigner(
         or chunk_size <= 0
     ):
         raise ValueError("chunk_size must be a positive integer")
-    try:
-        if np.iscomplexobj(hbar):
-            raise TypeError
-        hbar = float(hbar)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("hbar must be a positive finite real number") from exc
-    if not math.isfinite(hbar) or hbar <= 0:
-        raise ValueError("hbar must be a positive finite real number")
-
-    x = _axis(xvec, "xvec")
-    p = x if pvec is None else _axis(pvec, "pvec")
+    if isinstance(xvec, WignerGrid):
+        grid = xvec
+        if pvec is not None:
+            raise ValueError("pvec must be omitted when using WignerGrid")
+        if hbar != 1.0 and hbar != grid.hbar:
+            raise ValueError("hbar is already defined by WignerGrid")
+        hbar, x, p = grid.hbar, grid.x, grid.p
+    else:
+        # Narrow xvec to ArrayLike before passing it to _axis().
+        grid = None
+        hbar = _valid_hbar(hbar)
+        x = _axis(xvec, "xvec")
+        p = x if pvec is None else _axis(pvec, "pvec")
     if state.qtype == Qtype.ket:
         if len(state.dims[0]) != 1 or state.dims[1] != (1,):
             raise ValueError("wigner supports a single mode; use state.ptrace(mode)")
@@ -333,12 +379,16 @@ def wigner(
     nx = x.size
     for start in range(0, flat.size, chunk_size):
         end = min(flat.size, start + chunk_size)
-        indices = np.arange(start, end)
-        a: NDArray[np.complex128] = np.asarray(
-            scale * (x[indices % nx] + 1j * p[indices // nx]),
-            dtype=np.complex128,
-        )
-        z = a.real**2 + a.imag**2
+        if grid is not None:
+            a = grid._a[start:end]
+            z = grid._z[start:end]
+        else:
+            indices = np.arange(start, end)
+            a = np.asarray(
+                scale * (x[indices % nx] + 1j * p[indices // nx]),
+                dtype=np.complex128,
+            )
+            z = a.real**2 + a.imag**2
         if diagonals is not None:
             values = np.exp(-0.5 * z) * _wigner_clenshaw(diagonals, a, z)
         else:

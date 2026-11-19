@@ -199,6 +199,55 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
     return output
 
 
+def _apply_diagonal_sparse(
+    data: csr_array, dim: int, left: int, right: int, eta: float
+) -> csr_array:
+    """Thin a diagonal density operator without constructing Kraus terms.
+
+    Diagonal operators are classical photon-number distributions.  The
+    binomial kernel transforms only the selected Fock axis, so the working
+    storage is O(total Hilbert-space dimension), not O(D**2).
+    """
+    # Imported on this path only: regular photon-loss calls should not pay
+    # the import cost of the measurements package.
+    from optiqs.measurements.joint_photon_number import _loss_kernel
+
+    dtype = data.dtype if data.dtype.kind in "fc" else np.float64
+    populations = np.asarray(data.diagonal()).reshape(left, dim, right)
+    # _loss_kernel takes the probability of *losing* a photon, whereas this
+    # channel accepts transmissivity (survival probability).
+    kernel = _loss_kernel(dim, 1.0 - eta)
+    thinned = np.tensordot(kernel, populations, axes=(1, 1))
+    flattened = thinned.transpose(1, 0, 2).reshape(-1)
+    occupied = np.flatnonzero(flattened)
+    return csr_array(
+        (
+            flattened[occupied].astype(dtype, copy=False),
+            (occupied, occupied),
+        ),
+        shape=data.shape,
+    )
+
+
+def _use_diagonal_fast_path(data: csr_array, dim: int) -> bool:
+    """Avoid allocating a large dense diagonal for very sparse inputs.
+
+    Only CSR diagonal entries are inspected.  General inputs remain on the
+    coherence-preserving Kraus path; even a single off-diagonal entry makes
+    the specialized path inapplicable.
+    """
+    dimension = data.shape[0]
+    if (
+        data.nnz == 0
+        or data.nnz < max(1, dimension // 8)
+        or dim > 384
+        or dimension * np.dtype(data.dtype).itemsize > 64 * 1024 * 1024
+    ):
+        return False
+    coo = data.tocoo(copy=False)
+    return bool(np.all((coo.row == coo.col) | (coo.data == 0)))
+
+
 def _apply_zero_dense_torch(
     data: torch.Tensor, dim: int, left: int, right: int
 ) -> torch.Tensor:
@@ -334,7 +383,11 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
         result = (
             _apply_zero_sparse(data, dim, right)
             if eta == 0
-            else _apply_sparse(data, dim, right, float(eta))
+            else (
+                _apply_diagonal_sparse(data, dim, left, right, float(eta))
+                if _use_diagonal_fast_path(data, dim)
+                else _apply_sparse(data, dim, right, float(eta))
+            )
         )
     elif isinstance(data, np.ndarray):
         result = (

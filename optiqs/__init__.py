@@ -14,6 +14,8 @@ from optiqs.core import (
 )
 from optiqs.measurements import (
     homodyne_probabilities,
+    homodyne_probabilities_angles,
+    iter_joint_photon_number_branches,
     joint_photon_number_branches,
     joint_photon_number_probabilities,
     joint_pnrd,
@@ -43,7 +45,7 @@ from optiqs.operators import (
     sq,
     squeeze,
 )
-from optiqs.phase_space import wigner
+from optiqs.phase_space import WignerGrid, wigner
 from optiqs.states import (
     cat,
     coherent,
@@ -62,6 +64,7 @@ __all__ = [
     "LazyCacheInfo",
     "LazyCachedOperator",
     "Qobj",
+    "WignerGrid",
     "_to_numpy_dtype",
     "annihilation",
     "apply_local",
@@ -78,7 +81,9 @@ __all__ = [
     "get_device",
     "gkp",
     "homodyne_probabilities",
+    "homodyne_probabilities_angles",
     "identity",
+    "iter_joint_photon_number_branches",
     "joint_photon_number_branches",
     "joint_photon_number_probabilities",
     "joint_pnrd",

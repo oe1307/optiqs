@@ -1,5 +1,10 @@
-from optiqs.measurements.homodyne import homodyne_probabilities, measure_homodyne
+from optiqs.measurements.homodyne import (
+    homodyne_probabilities,
+    homodyne_probabilities_angles,
+    measure_homodyne,
+)
 from optiqs.measurements.joint_photon_number import (
+    iter_joint_photon_number_branches,
     joint_photon_number_branches,
     joint_photon_number_probabilities,
     joint_pnrd,
@@ -16,6 +21,8 @@ from optiqs.measurements.post_selection import post_select, postselect_photon_nu
 
 __all__ = [
     "homodyne_probabilities",
+    "homodyne_probabilities_angles",
+    "iter_joint_photon_number_branches",
     "joint_photon_number_branches",
     "joint_photon_number_probabilities",
     "joint_pnrd",

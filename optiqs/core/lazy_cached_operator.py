@@ -81,6 +81,10 @@ class LazyCachedOperator:
     max_block_dim : int, default 512
         Never materialize an exponential larger than this dimension, even
         when the byte limit would allow it; oversized blocks stay lazy.
+    adaptive_cache : bool, default False
+        On a wide right-hand side, consider caching the block exponential
+        on its first use instead of waiting for ``cache_after`` applications.
+        The regular memory and block-size limits still apply.
 
     Notes
     -----
@@ -105,6 +109,7 @@ class LazyCachedOperator:
         cache_after: int = 2,
         max_cache_mb: float = 256.0,
         max_block_dim: int = 512,
+        adaptive_cache: bool = False,
     ) -> None:
         if isinstance(generator, Qobj):
             base = Expm(generator, scale=scale)
@@ -136,12 +141,15 @@ class LazyCachedOperator:
             raise ValueError("max_cache_mb must be nonnegative and finite")
         if blocks is not None and block_labels is not None:
             raise ValueError("pass either blocks or block_labels, not both")
+        if not isinstance(adaptive_cache, (bool, np.bool_)):
+            raise TypeError("adaptive_cache must be a boolean")
 
         self._data: _MatrixData = base._data.copy()
         self._dims: tuple[tuple[int, ...], tuple[int, ...]] = base.dims
         self._tol: float = base._tol
         self.cache_after: int = int(cache_after)
         self.max_block_dim: int = int(max_block_dim)
+        self.adaptive_cache: bool = bool(adaptive_cache)
         self.max_cache_bytes: int = int(max_cache_mb * 1024 * 1024)
         self._blocks: tuple[np.ndarray, ...] = self._make_blocks(
             self.shape[0], blocks, block_labels
@@ -163,6 +171,10 @@ class LazyCachedOperator:
         self._hits: int = 0
         self._misses: int = 0
         self._evictions: int = 0
+        # An expensive expm runs outside the global cache lock.  Track blocks
+        # already being built to avoid duplicate work by concurrent callers.
+        self._building: set[int] = set()
+        self._cache_epoch: int = 0
         self._lock: _RLockType = RLock()
 
     @property
@@ -264,6 +276,8 @@ class LazyCachedOperator:
     def clear_cache(self, *, reset_stats: bool = True) -> None:
         """Drop cached exponentials. Optionally reset access counters as well."""
         with self._lock:
+            # In-flight builds must not repopulate the cache after a clear.
+            self._cache_epoch += 1
             self._cache.clear()
             self._block_data.clear()
             self._cached_bytes = 0
@@ -282,9 +296,12 @@ class LazyCachedOperator:
     ) -> np.ndarray | sparse.csr_array:
         with self._lock:
             generator = self._block_data.get(block_id)
-            if generator is None:
-                generator = self._slice_generator(self._blocks[block_id])
-                self._block_data[block_id] = generator
+        if generator is None:
+            # Slicing large, independent blocks should not serialize all
+            # other threads merely because their blocks are cache misses.
+            sliced = self._slice_generator(self._blocks[block_id])
+            with self._lock:
+                generator = self._block_data.setdefault(block_id, sliced)
         m = generator.shape[0]
         # Guard persistent memory AND cubic construction costs. This only
         # estimates the final dense output; temporary memory can be larger.
@@ -294,6 +311,8 @@ class LazyCachedOperator:
             and estimated <= self.max_cache_bytes
             and self.max_cache_bytes > 0
         )
+        build = False
+        epoch = 0
         with self._lock:
             matrix = self._cache.get(block_id)
             if matrix is not None:
@@ -302,16 +321,41 @@ class LazyCachedOperator:
             else:
                 self._misses += 1
                 self._use_count[block_id] += 1
-                if eligible and self._use_count[block_id] >= self.cache_after:
-                    # Narrow on ndarray first: SciPy's sparse superclass is
-                    # incompletely modelled by some static type checkers.
-                    if isinstance(generator, np.ndarray):
-                        dense = generator
-                    else:
-                        dense = generator.toarray()
-                    matrix = np.asarray(expm(dense))
-                    matrix.flags.writeable = False
-                    nbytes = matrix.nbytes
+                # Dense/wide operands amortize explicit expm more readily:
+                # one block can be reused across many RHS columns at once.
+                threshold = self.cache_after
+                if self.adaptive_cache and rhs.shape[1] >= max(8, m // 2):
+                    threshold = 1
+                if (
+                    eligible
+                    and self._use_count[block_id] >= threshold
+                    and block_id not in self._building
+                ):
+                    self._building.add(block_id)
+                    epoch = self._cache_epoch
+                    build = True
+
+        if build:
+            try:
+                # SciPy expm can take much longer than all the cache bookkeeping.
+                # Never hold the global lock across this cubic computation.
+                dense = (
+                    generator
+                    if isinstance(generator, np.ndarray)
+                    else generator.toarray()
+                )
+                constructed = np.asarray(expm(dense))
+                constructed.flags.writeable = False
+            except BaseException:
+                with self._lock:
+                    self._building.discard(block_id)
+                raise
+            with self._lock:
+                self._building.discard(block_id)
+                if epoch == self._cache_epoch:
+                    # Another thread cannot have built this block concurrently,
+                    # but clear_cache() may have invalidated an earlier attempt.
+                    nbytes = constructed.nbytes
                     if nbytes <= self.max_cache_bytes:
                         while (
                             self._cache
@@ -320,8 +364,11 @@ class LazyCachedOperator:
                             _, old = self._cache.popitem(last=False)
                             self._cached_bytes -= old.nbytes
                             self._evictions += 1
-                        self._cache[block_id] = matrix
+                        self._cache[block_id] = constructed
                         self._cached_bytes += nbytes
+                # This invocation can still apply its computed matrix after a
+                # clear; only persistent cache publication is suppressed.
+                matrix = constructed
 
         # SciPy's sparse-RHS expm_multiply can be much slower than its dense
         # implementation, especially for a sparse ket with only one column.
@@ -504,6 +551,7 @@ class LazyCachedOperator:
             cache_after=self.cache_after,
             max_cache_mb=self.max_cache_bytes / 1024**2,
             max_block_dim=self.max_block_dim,
+            adaptive_cache=self.adaptive_cache,
         )
 
     def dag(self) -> LazyCachedOperator:
