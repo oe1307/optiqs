@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
+from functools import lru_cache
 from math import isfinite, log, log1p, prod, sqrt
 from numbers import Integral, Real
 from typing import TYPE_CHECKING
@@ -121,12 +122,30 @@ def _loss_row(dim: int, detected: int, eta: float) -> np.ndarray:
     return row
 
 
-def _loss_kernel(dim: int, eta: float) -> np.ndarray:
-    """Binomial thinning matrix, rows=detected and columns=incident counts."""
+# Bound both the number of cached entries and the size of each entry.
+# At most 16 MiB of float64 kernel data can remain in the cache.
+_MAX_CACHED_LOSS_KERNEL_BYTES = 1 << 20  # 1 MiB per kernel
+
+
+def _build_loss_kernel(dim: int, eta: float) -> np.ndarray:
     kernel = np.zeros((dim, dim), dtype=np.float64)
     for detected in range(dim):
         kernel[detected, detected:] = _loss_row(dim, detected, eta)[detected:]
+    # Cached matrices must not be changed by a caller.
+    kernel.flags.writeable = False
     return kernel
+
+
+@lru_cache(maxsize=16)
+def _cached_loss_kernel(dim: int, eta: float) -> np.ndarray:
+    return _build_loss_kernel(dim, eta)
+
+
+def _loss_kernel(dim: int, eta: float) -> np.ndarray:
+    """Binomial thinning matrix, rows=detected and columns=incident counts."""
+    if dim * dim * np.dtype(np.float64).itemsize > _MAX_CACHED_LOSS_KERNEL_BYTES:
+        return _build_loss_kernel(dim, eta)
+    return _cached_loss_kernel(dim, eta)
 
 
 def _loss_parent_weights(

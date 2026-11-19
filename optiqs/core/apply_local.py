@@ -221,6 +221,52 @@ def _apply_sparse_rows(
     )
 
 
+def _apply_sparse_diagonal(
+    state: Qobj, gate: LocalGate, selected: tuple[int, ...]
+) -> Qobj | None:
+    """Apply a diagonal CSR gate via Fock-index factors, without repacking.
+
+    The fast path also supports nonunitary diagonal Kraus operators: kets
+    receive K, bras receive K.dag(), and operators receive K rho K.dag().
+    Only NumPy/SciPy CSR data is handled here; all other inputs fall back.
+    """
+    if not isinstance(gate, Qobj):
+        return None
+    state_data, gate_data = state._data, gate._data
+    if not isinstance(state_data, sparse.csr_array) or not isinstance(
+        gate_data, sparse.csr_array
+    ):
+        return None
+    gate_entries = gate_data.tocoo(copy=False)
+    if np.any(gate_entries.row != gate_entries.col):
+        return None
+
+    diagonal = gate_data.diagonal()
+    entries = state_data.tocoo(copy=False)
+    if state.qtype == Qtype.bra:
+        indices = _extract_flat_index(entries.col, state.dims[1], selected)
+        values = entries.data * np.conjugate(diagonal[indices])
+    elif state.qtype == Qtype.ket:
+        indices = _extract_flat_index(entries.row, state.dims[0], selected)
+        values = entries.data * diagonal[indices]
+    else:
+        row_indices = _extract_flat_index(entries.row, state.dims[0], selected)
+        col_indices = _extract_flat_index(entries.col, state.dims[1], selected)
+        values = (
+            entries.data * diagonal[row_indices] * np.conjugate(diagonal[col_indices])
+        )
+    result = sparse.csr_array(
+        cast(Any, (values, (entries.row, entries.col))),
+        shape=state_data.shape,
+    )
+    return Qobj(
+        result,
+        dims=state.dims,
+        qtype=state.qtype,
+        tol=max(state._tol, gate._tol),
+    )
+
+
 def _apply_rows(state: Qobj, gate: LocalGate, selected: tuple[int, ...]) -> Qobj:
     if isinstance(state._data, sparse.csr_array):
         return _apply_sparse_rows(state, gate, selected)
@@ -303,6 +349,10 @@ def apply_local(
             "Cannot mix PyTorch and NumPy/SciPy data in apply_local; "
             "convert the gate and state to the same backend"
         )
+
+    diagonal_result = _apply_sparse_diagonal(state, gate, selected)
+    if diagonal_result is not None:
+        return diagonal_result
 
     if state.qtype == Qtype.bra:
         return _apply_rows(state.dag(), gate, selected).dag()

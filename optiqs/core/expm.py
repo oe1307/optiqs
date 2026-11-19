@@ -33,16 +33,35 @@ def _transpose(data: _MatrixData) -> _MatrixData:
     return sparse.csr_array(cast(Any, data.T))
 
 
+# Only convert small, few-column sparse right-hand sides. Converting an
+# operator or a large batch to dense would defeat the sparse-memory model.
+_MAX_DENSE_RHS_BYTES = 1 << 20  # 1 MiB
+_MAX_DENSE_RHS_COLUMNS = 16
+
+
 def _expm_action(a: _MatrixData, b: _MatrixData) -> _MatrixData:
     """Apply exp(a) to b, normalizing SciPy's result to NumPy or CSR.
 
-    SciPy's expm_multiply accepts sparse right-hand sides and preserves their
-    sparse representation at runtime.  Current scipy-stubs overloads are more
-    restrictive for combinations of dense/sparse matrices.  The cast is
-    deliberately limited to this one third-party API boundary, followed by a
-    runtime type check of its result.
+    SciPy's sparse-RHS path can be slow for small kets. In that case a
+    bounded, temporary dense RHS is faster; convert the result back to CSR
+    so callers still receive a sparse Qobj. Large RHSs stay sparse.
     """
-    scipy_call = cast(Callable[[_MatrixData, _MatrixData], object], expm_multiply)
+    # Keep the cast confined to the scipy-stubs API boundary.
+    scipy_call = cast(Callable[..., object], expm_multiply)
+    if isinstance(b, sparse.csr_array) and b.shape[1] <= _MAX_DENSE_RHS_COLUMNS:
+        output_dtype = np.result_type(a.dtype, b.dtype, np.float64)
+        rhs_bytes = b.shape[0] * b.shape[1] * output_dtype.itemsize
+        if rhs_bytes <= _MAX_DENSE_RHS_BYTES:
+            # Passing the exact trace avoids SciPy's sparse trace estimate.
+            # Dense A does not require this optimization.
+            if isinstance(a, sparse.csr_array):
+                result = scipy_call(a, b.toarray(), traceA=np.sum(a.diagonal()))
+            else:
+                result = scipy_call(a, b.toarray())
+            if not isinstance(result, np.ndarray):
+                raise TypeError(f"Unexpected expm_multiply output type: {type(result)}")
+            return sparse.csr_array(result)
+
     result = scipy_call(a, b)
     if isinstance(result, np.ndarray):
         return result

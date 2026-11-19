@@ -82,8 +82,14 @@ def _apply_dense_numpy(
     return output
 
 
+# Avoid rebuilding the output CSR for every Kraus term while keeping
+# buffered COO entries bounded for states with many occupied Fock levels.
+_SPARSE_LOSS_BATCH_TERMS = 5
+_SPARSE_LOSS_BATCH_MAX_ENTRIES = 250_000
+
+
 def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_array:
-    """Shift only occupied entries; accumulate one jump at a time in CSR."""
+    """Shift occupied entries and combine bounded groups of Kraus terms."""
     matrix = data.tocoo()
     rows, cols, values = matrix.row, matrix.col, matrix.data
     size = data.shape[0]
@@ -96,6 +102,27 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
     col_photons = (cols // stride) % dim
     max_lost = min(int(row_photons.max()), int(col_photons.max()))
     log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+    batch_rows: list[np.ndarray] = []
+    batch_cols: list[np.ndarray] = []
+    batch_values: list[np.ndarray] = []
+    batch_entries = 0
+
+    def flush_batch() -> None:
+        nonlocal output, batch_entries
+        if not batch_rows:
+            return
+        partial = csr_array(
+            (
+                np.concatenate(batch_values),
+                (np.concatenate(batch_rows), np.concatenate(batch_cols)),
+            ),
+            shape=(size, size),
+        )
+        output = output + partial
+        batch_rows.clear()
+        batch_cols.clear()
+        batch_values.clear()
+        batch_entries = 0
 
     for lost in range(max_lost + 1):
         eligible = (row_photons >= lost) & (col_photons >= lost)
@@ -114,16 +141,20 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
         selected_rows = rows[eligible][nonzero] - lost * stride
         selected_cols = cols[eligible][nonzero] - lost * stride
         # Some scipy-stubs versions do not accept `dtype` for the
-        # COO-style CSR constructor. Convert the values beforehand to
-        # preserve the intended output dtype without that keyword.
+        # COO-style CSR constructor. Convert the values beforehand.
         selected_values = coefficients[nonzero].astype(output_dtype, copy=False)
-        partial = csr_array(
-            (selected_values, (selected_rows, selected_cols)),
-            shape=(size, size),
-        )
-        # Incremental addition bounds peak memory to the result and input,
-        # instead of holding up to `dim * nnz` COO entries simultaneously.
-        output = output + partial
+        batch_rows.append(selected_rows)
+        batch_cols.append(selected_cols)
+        batch_values.append(selected_values)
+        batch_entries += selected_values.size
+        # Flush at a term count or entry limit; an individual term can
+        # exceed the limit, but is never split into additional copies.
+        if (
+            len(batch_rows) >= _SPARSE_LOSS_BATCH_TERMS
+            or batch_entries >= _SPARSE_LOSS_BATCH_MAX_ENTRIES
+        ):
+            flush_batch()
+    flush_batch()
     return output
 
 
