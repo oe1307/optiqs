@@ -12,6 +12,7 @@ from numpy.typing import DTypeLike
 from scipy.sparse import csr_array, diags_array
 
 from optiqs.core.expm import Expm
+from optiqs.core.lazy_cached_operator import LazyCachedOperator
 from optiqs.core.q_obj import Qobj, Qtype
 
 
@@ -24,7 +25,9 @@ def squeeze(
     *,
     lazy: bool = True,
     z: complex | None = None,
-) -> Expm | Qobj:
+    cache_blocks: bool = False,
+    max_cache_mb: float = 256.0,
+) -> Expm | LazyCachedOperator | Qobj:
     """Construct the single-mode squeezing operator in a truncated Fock basis.
 
     The convention is ``S(z) = exp[(conj(z) * a**2 - z * (a.dag())**2)/2]``,
@@ -58,10 +61,16 @@ def squeeze(
     z : complex, optional
         Alternative direct complex squeezing parameter. Cannot be combined
         with nonzero ``r`` or ``phi``.
+    cache_blocks : bool, optional
+        If true, exploit the even/odd Fock-parity invariant blocks with
+        ``LazyCachedOperator`` (without changing the default ``Expm`` API).
+        Reusing the returned operator across states permits block caching.
+    max_cache_mb : float, optional
+        Persistent parity-block cache budget when ``cache_blocks=True``.
 
     Returns
     -------
-    Expm or Qobj
+    Expm, LazyCachedOperator or Qobj
         Squeezing operator with subsystem dimensions ``((dim,), (dim,))``.
 
     Notes
@@ -105,6 +114,15 @@ def squeeze(
 
     if not isinstance(lazy, (bool, np.bool_)):
         raise TypeError("lazy must be a boolean")
+    if not isinstance(cache_blocks, (bool, np.bool_)):
+        raise TypeError("cache_blocks must be a boolean")
+    if cache_blocks and (
+        isinstance(max_cache_mb, (bool, np.bool_))
+        or not isinstance(max_cache_mb, Real)
+        or not math.isfinite(max_cache_mb)
+        or max_cache_mb < 0
+    ):
+        raise ValueError("max_cache_mb must be finite and nonnegative")
     if (
         isinstance(tol, (bool, np.bool_))
         or not isinstance(tol, Real)
@@ -155,10 +173,16 @@ def squeeze(
             dtype=numeric_dtype,
         )
 
-    op = Expm(
-        Qobj(generator, dims=((dim,), (dim,)), qtype=Qtype.oper, tol=tol),
-        scale=strength,
-    )
+    q_generator = Qobj(generator, dims=((dim,), (dim,)), qtype=Qtype.oper, tol=tol)
+    if cache_blocks:
+        op = LazyCachedOperator(
+            q_generator,
+            scale=strength,
+            block_labels=np.arange(dim, dtype=np.intp) % 2,
+            max_cache_mb=float(max_cache_mb),
+        )
+    else:
+        op = Expm(q_generator, scale=strength)
     return op if lazy else op.to_qobj()
 
 

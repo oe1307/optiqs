@@ -348,8 +348,15 @@ class Qobj:
         data[index] = value
 
     @staticmethod
-    def _binary_data(left: Qobj, right: Qobj) -> tuple[Any, Any]:
-        """Align dense/sparse backends and promote PyTorch dtypes."""
+    def _binary_data(
+        left: Qobj, right: Qobj, *, for_matmul: bool = False
+    ) -> tuple[Any, Any]:
+        """Align backends for arithmetic without unnecessary densification.
+
+        SciPy supports CSR @ ndarray and ndarray @ CSR directly.  Keep those
+        mixed operands sparse for matrix multiplication only; addition and
+        subtraction still use the existing dense conversion semantics.
+        """
         left_data, right_data = left._data, right._data
         left_torch = not isinstance(left_data, (np.ndarray, sp.sparse.csr_array))
         right_torch = not isinstance(right_data, (np.ndarray, sp.sparse.csr_array))
@@ -374,8 +381,13 @@ class Qobj:
             dtype = torch.promote_types(left_data.dtype, right_data.dtype)
             return left_data.to(dtype=dtype), right_data.to(dtype=dtype)
 
-        # A sparse + dense expression is made dense explicitly. Two sparse
-        # operands stay sparse; two NumPy arrays stay NumPy arrays.
+        if for_matmul:
+            # Do not construct a dense copy of a potentially huge CSR matrix.
+            # SciPy handles both orders of CSR/ndarray matrix products.
+            return left_data, right_data
+
+        # Addition/subtraction still produce dense arrays for mixed backends.
+        # Two sparse operands stay sparse; two NumPy arrays stay dense.
         if isinstance(left_data, sp.sparse.csr_array) and isinstance(
             right_data, np.ndarray
         ):
@@ -503,7 +515,7 @@ class Qobj:
                 f"{self.dims[1]} and {other.dims[0]}"
             )
 
-        left, right = self._binary_data(self, other)
+        left, right = self._binary_data(self, other, for_matmul=True)
         result = left @ right
         dims = (self.dims[0], other.dims[1])
 

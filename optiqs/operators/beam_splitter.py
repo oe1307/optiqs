@@ -68,13 +68,15 @@ def beam_splitter(
     tol : float, optional
         Non-negative, finite pruning tolerance used by ``Qobj``.
     lazy : bool, optional
-        If true (default), return a ``LazyCachedOperator`` that processes
-        only the total-photon-number blocks touched by an input state and
-        caches frequently used block exponentials in memory. If false,
-        return a dense ``Qobj`` for the full unitary.
+        With ``precompute=False``, return a ``LazyCachedOperator`` (default)
+        which processes only touched total-photon-number blocks and caches
+        frequently used exponentials. When false, materialize a dense
+        ``Qobj`` for the full unitary.
     precompute : bool, optional
-        Construct and cache a block-sparse ``Qobj`` eagerly instead of a
-        lazy operator. Results are shared and read-only; call ``.copy()``
+        If true (default), construct and cache a block-sparse ``Qobj``
+        eagerly. This favors repeated uses of the same operator; for a
+        one-shot application, ``precompute=False`` can avoid unnecessary
+        work. Precomputed results are shared and read-only; call ``.copy()``
         before modifying them. Incompatible with ``lazy=False``.
     cache_dir : str or None, optional
         Directory for persisting precomputed operators. Used only with

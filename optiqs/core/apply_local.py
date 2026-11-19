@@ -182,9 +182,9 @@ def _apply_sparse_rows(
         qtype=Qtype.oper,
         tol=state._tol,
     )
-    # A dense *local* Qobj is cheap to convert to CSR relative to the full
-    # Hilbert space. This prevents Qobj's mixed-backend matrix product from
-    # converting the enormous packed sparse RHS into a dense array.
+    # Although Qobj now accepts mixed CSR/NumPy matmul, multiplying a dense
+    # local gate by this sparse, very wide RHS yields a dense output. Convert
+    # only the small local gate to CSR so the packed result remains sparse.
     if isinstance(gate, Qobj) and isinstance(gate._data, np.ndarray):
         gate = Qobj(
             sparse.csr_array(gate._data),
@@ -242,22 +242,37 @@ def _apply_sparse_diagonal(
         return None
 
     diagonal = gate_data.diagonal()
-    entries = state_data.tocoo(copy=False)
+    # CSR indices already encode columns.  Reuse indptr/indices directly
+    # instead of converting a potentially large ket or density to COO and
+    # reconstructing the CSR index structure afterwards.
     if state.qtype == Qtype.bra:
-        indices = _extract_flat_index(entries.col, state.dims[1], selected)
-        values = entries.data * np.conjugate(diagonal[indices])
-    elif state.qtype == Qtype.ket:
-        indices = _extract_flat_index(entries.row, state.dims[0], selected)
-        values = entries.data * diagonal[indices]
+        indices = _extract_flat_index(state_data.indices, state.dims[1], selected)
+        values = state_data.data * np.conjugate(diagonal[indices])
     else:
-        row_indices = _extract_flat_index(entries.row, state.dims[0], selected)
-        col_indices = _extract_flat_index(entries.col, state.dims[1], selected)
-        values = (
-            entries.data * diagonal[row_indices] * np.conjugate(diagonal[col_indices])
-        )
+        # Reconstruct row indices only for the *stored* entries. For very
+        # sparse states searchsorted avoids allocating arange(num_rows) and
+        # walking a huge indptr; otherwise repeat is faster.
+        if state_data.nnz < max(1, state_data.shape[0] // 100):
+            rows = np.searchsorted(
+                state_data.indptr[1:],
+                np.arange(state_data.nnz, dtype=state_data.indptr.dtype),
+                side="right",
+            )
+        else:
+            rows = np.repeat(
+                np.arange(state_data.shape[0], dtype=state_data.indptr.dtype),
+                np.diff(state_data.indptr),
+            )
+        row_indices = _extract_flat_index(rows, state.dims[0], selected)
+        values = state_data.data * diagonal[row_indices]
+        if state.qtype == Qtype.oper:
+            col_indices = _extract_flat_index(
+                state_data.indices, state.dims[1], selected
+            )
+            values *= np.conjugate(diagonal[col_indices])
+
     result = sparse.csr_array(
-        cast(Any, (values, (entries.row, entries.col))),
-        shape=state_data.shape,
+        (values, state_data.indices, state_data.indptr), shape=state_data.shape
     )
     return Qobj(
         result,

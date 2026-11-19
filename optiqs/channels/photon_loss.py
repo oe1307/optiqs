@@ -48,6 +48,25 @@ def _jump_amplitudes(
     return np.exp(0.5 * log_probability)
 
 
+def _apply_zero_dense_numpy(
+    data: np.ndarray, dim: int, left: int, right: int
+) -> np.ndarray:
+    """At eta=0, replace the selected mode with vacuum after tracing it out."""
+    if data.dtype.kind not in "fc":
+        data = data.astype(np.float64)
+    elif data.dtype == np.float16:
+        data = data.astype(np.float32)
+
+    source = data.reshape(left, dim, right, left, dim, right)
+    output = np.zeros_like(data)
+    # trace over the two selected-mode indices, retaining the full original
+    # operator shape and mode ordering. No dim-term Kraus loop is necessary.
+    output.reshape(left, dim, right, left, dim, right)[:, 0, :, :, 0, :] = np.trace(
+        source, axis1=1, axis2=4
+    )
+    return output
+
+
 def _apply_dense_numpy(
     data: np.ndarray, dim: int, left: int, right: int, eta: float
 ) -> np.ndarray:
@@ -86,6 +105,28 @@ def _apply_dense_numpy(
 # buffered COO entries bounded for states with many occupied Fock levels.
 _SPARSE_LOSS_BATCH_TERMS = 5
 _SPARSE_LOSS_BATCH_MAX_ENTRIES = 250_000
+
+
+def _apply_zero_sparse(data: csr_array, dim: int, stride: int) -> csr_array:
+    """Pure loss at eta=0 by summing only matching Fock-number entries."""
+    coo = data.tocoo(copy=False)
+    dtype = data.dtype if data.dtype.kind in "fc" else np.float64
+    if coo.nnz == 0:
+        return csr_array(data.shape, dtype=dtype)
+
+    row_numbers = (coo.row // stride) % dim
+    col_numbers = (coo.col // stride) % dim
+    same_number = row_numbers == col_numbers
+    offset = row_numbers[same_number] * stride
+    # COO construction combines entries from different original photon
+    # numbers that map onto the same vacuum output coordinate.
+    return csr_array(
+        (
+            coo.data[same_number].astype(dtype, copy=False),
+            (coo.row[same_number] - offset, coo.col[same_number] - offset),
+        ),
+        shape=data.shape,
+    )
 
 
 def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_array:
@@ -155,6 +196,28 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
         ):
             flush_batch()
     flush_batch()
+    return output
+
+
+def _apply_zero_dense_torch(
+    data: torch.Tensor, dim: int, left: int, right: int
+) -> torch.Tensor:
+    """Trace out the lost mode on device, preserving autograd."""
+    import torch
+
+    if not (data.is_floating_point() or data.is_complex()):
+        data = data.to(
+            dtype=torch.float32 if data.device.type == "mps" else torch.float64
+        )
+    elif data.dtype in (torch.float16, torch.bfloat16):
+        data = data.to(torch.float32)
+
+    source = data.reshape(left, dim, right, left, dim, right)
+    reduced = source.diagonal(dim1=1, dim2=4).sum(dim=-1)
+    output = torch.zeros_like(data)
+    # CopySlices maintains the gradient connection to reduced (even when
+    # the input requires_grad), and never transfers data to the CPU.
+    output.reshape(left, dim, right, left, dim, right)[:, 0, :, :, 0, :] = reduced
     return output
 
 
@@ -268,9 +331,21 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     right = math.prod(dims[mode + 1 :])
     data = density._data
     if isinstance(data, csr_array):
-        result = _apply_sparse(data, dim, right, float(eta))
+        result = (
+            _apply_zero_sparse(data, dim, right)
+            if eta == 0
+            else _apply_sparse(data, dim, right, float(eta))
+        )
     elif isinstance(data, np.ndarray):
-        result = _apply_dense_numpy(data, dim, left, right, float(eta))
+        result = (
+            _apply_zero_dense_numpy(data, dim, left, right)
+            if eta == 0
+            else _apply_dense_numpy(data, dim, left, right, float(eta))
+        )
     else:
-        result = _apply_dense_torch(data, dim, left, right, float(eta))
+        result = (
+            _apply_zero_dense_torch(data, dim, left, right)
+            if eta == 0
+            else _apply_dense_torch(data, dim, left, right, float(eta))
+        )
     return Qobj(result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol)
