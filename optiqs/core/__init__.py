@@ -1,3 +1,4 @@
+from optiqs.core.apply_local import apply_local
 from optiqs.core.expm import Expm
 from optiqs.core.fidelity import fidelity
 from optiqs.core.io import load_state, save_state
@@ -10,6 +11,7 @@ __all__ = [
     "LazyCacheInfo",
     "LazyCachedOperator",
     "Qobj",
+    "apply_local",
     "fidelity",
     "load_state",
     "save_state",
