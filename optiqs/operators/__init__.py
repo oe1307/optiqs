@@ -1,5 +1,6 @@
 from optiqs.operators.annihilation import annihilation, destroy
 from optiqs.operators.beam_splitter import beam_splitter, bs
+from optiqs.operators.displace import disp, displace
 from optiqs.operators.identity import identity, qeye
 from optiqs.operators.number import num, number
 from optiqs.operators.phase_shift import phase_shift, rot
@@ -10,6 +11,8 @@ __all__ = [
     "beam_splitter",
     "bs",
     "destroy",
+    "disp",
+    "displace",
     "identity",
     "num",
     "number",
