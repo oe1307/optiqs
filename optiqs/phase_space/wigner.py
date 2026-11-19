@@ -309,7 +309,7 @@ def wigner(
     hbar: float = 1.0,
     method: WignerMethod = "auto",
     chunk_size: int = 32768,
-    accelerator: Literal["numpy", "numba"] = "numpy",
+    accelerator: Literal["numpy", "numba", "numba-parallel"] = "numpy",
 ) -> NDArray[np.float64]:
     """Compute a one-mode state's Wigner function W(x, p).
 
@@ -333,6 +333,9 @@ def wigner(
 
     ``accelerator='numba'`` optionally JIT-compiles the entire Clenshaw
     contraction when that method is used (requires ``pip install OptiQS[jit]``).
+    ``accelerator='numba-parallel'`` uses independent Numba threads for grid
+    points and is generally useful only for sufficiently large grids. The
+    number of threads follows Numba's settings (e.g. NUMBA_NUM_THREADS).
     The first call includes compilation overhead. The NumPy default avoids
     the optional dependency and retains startup performance.
     """
@@ -340,8 +343,8 @@ def wigner(
         raise TypeError("state must be an optiqs.Qobj")
     if method not in ("auto", "clenshaw", "laguerre"):
         raise ValueError("method must be 'auto', 'clenshaw', or 'laguerre'")
-    if accelerator not in ("numpy", "numba"):
-        raise ValueError("accelerator must be 'numpy' or 'numba'")
+    if accelerator not in ("numpy", "numba", "numba-parallel"):
+        raise ValueError("accelerator must be 'numpy', 'numba' or 'numba-parallel'")
     if (
         isinstance(chunk_size, bool)
         or not isinstance(chunk_size, int)
@@ -422,15 +425,22 @@ def wigner(
     # within a single per-point loop; no per-diagonal complex arrays are made.
     numba_kernel = None
     packed_diagonals = None
-    if accelerator == "numba" and diagonals is not None:
+    if accelerator in ("numba", "numba-parallel") and diagonals is not None:
         try:
-            from optiqs.phase_space._wigner_numba import fused_wigner_clenshaw
+            from optiqs.phase_space._wigner_numba import (
+                fused_wigner_clenshaw,
+                parallel_fused_wigner_clenshaw,
+            )
         except ImportError as exc:
             raise ImportError(
-                "Numba is required for accelerator='numba'; "
+                "Numba is required for accelerator='numba' or 'numba-parallel'; "
                 "install with `pip install OptiQS[jit]`"
             ) from exc
-        numba_kernel = fused_wigner_clenshaw
+        numba_kernel = (
+            parallel_fused_wigner_clenshaw
+            if accelerator == "numba-parallel"
+            else fused_wigner_clenshaw
+        )
         packed_diagonals = _pack_wigner_diagonals(diagonals)
 
     output = np.zeros((p.size, x.size), dtype=np.float64)

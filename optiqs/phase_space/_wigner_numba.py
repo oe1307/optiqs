@@ -14,7 +14,9 @@ from numpy.typing import NDArray
 # Numba is optional; resolve it only when this module is explicitly loaded.
 # A direct `from numba import njit` fails static checking in environments
 # where the optional JIT extra is not installed.
-njit = import_module("numba").njit
+_numba = import_module("numba")
+njit = _numba.njit
+prange = _numba.prange
 
 
 @njit(cache=True)
@@ -47,6 +49,48 @@ def clenshaw_laguerre(
     return output
 
 
+@njit(cache=True, inline="always")
+def _wigner_point(
+    coefficients: NDArray[np.complex128],
+    starts: NDArray[np.int64],
+    lengths: NDArray[np.int64],
+    offsets: NDArray[np.int64],
+    inverse_denominators: NDArray[np.float64],
+    back_factors: NDArray[np.float64],
+    amplitudes: NDArray[np.complex128],
+    arguments: NDArray[np.float64],
+    j: int,
+) -> float:
+    """Pointwise Clenshaw recurrence shared by sequential/parallel kernels."""
+    accumulator = 0j
+    previous = -1
+    for k in range(len(offsets)):
+        offset = offsets[k]
+        if previous >= 0:
+            for power in range(previous, offset, -1):
+                accumulator *= amplitudes[j] / np.sqrt(power)
+        ahead = 0j
+        two_ahead = 0j
+        start = starts[k]
+        for n in range(lengths[k] - 1, -1, -1):
+            idx = start + n
+            current = (
+                coefficients[idx]
+                + (arguments[j] - (2 * n + offset + 1))
+                * inverse_denominators[idx]
+                * ahead
+                - back_factors[idx] * two_ahead
+            )
+            two_ahead = ahead
+            ahead = current
+        accumulator += ahead
+        previous = offset
+    if previous >= 0:
+        for power in range(previous, 0, -1):
+            accumulator *= amplitudes[j] / np.sqrt(power)
+    return np.exp(-0.5 * arguments[j]) * accumulator.real
+
+
 @njit(cache=True)
 def fused_wigner_clenshaw(
     coefficients: NDArray[np.complex128],
@@ -58,38 +102,46 @@ def fused_wigner_clenshaw(
     amplitudes: NDArray[np.complex128],
     arguments: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Evaluate all superdiagonals, offset powers and the Gaussian in one loop.
-
-    This avoids allocating one complex vector per superdiagonal and per
-    missing power, which was a sizable overhead with many Fock levels.
-    """
+    """Sequential fused Clenshaw recurrence for small grids."""
     output = np.empty(len(arguments), dtype=np.float64)
     for j in range(len(arguments)):
-        accumulator = 0j
-        previous = -1
-        for k in range(len(offsets)):
-            offset = offsets[k]
-            if previous >= 0:
-                for power in range(previous, offset, -1):
-                    accumulator *= amplitudes[j] / np.sqrt(power)
-            ahead = 0j
-            two_ahead = 0j
-            start = starts[k]
-            for n in range(lengths[k] - 1, -1, -1):
-                idx = start + n
-                current = (
-                    coefficients[idx]
-                    + (arguments[j] - (2 * n + offset + 1))
-                    * inverse_denominators[idx]
-                    * ahead
-                    - back_factors[idx] * two_ahead
-                )
-                two_ahead = ahead
-                ahead = current
-            accumulator += ahead
-            previous = offset
-        if previous >= 0:
-            for power in range(previous, 0, -1):
-                accumulator *= amplitudes[j] / np.sqrt(power)
-        output[j] = np.exp(-0.5 * arguments[j]) * accumulator.real
+        output[j] = _wigner_point(
+            coefficients,
+            starts,
+            lengths,
+            offsets,
+            inverse_denominators,
+            back_factors,
+            amplitudes,
+            arguments,
+            j,
+        )
+    return output
+
+
+@njit(cache=True, parallel=True)
+def parallel_fused_wigner_clenshaw(
+    coefficients: NDArray[np.complex128],
+    starts: NDArray[np.int64],
+    lengths: NDArray[np.int64],
+    offsets: NDArray[np.int64],
+    inverse_denominators: NDArray[np.float64],
+    back_factors: NDArray[np.float64],
+    amplitudes: NDArray[np.complex128],
+    arguments: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Distribute independent grid points over Numba's configured threads."""
+    output = np.empty(len(arguments), dtype=np.float64)
+    for j in prange(len(arguments)):
+        output[j] = _wigner_point(
+            coefficients,
+            starts,
+            lengths,
+            offsets,
+            inverse_denominators,
+            back_factors,
+            amplitudes,
+            arguments,
+            j,
+        )
     return output

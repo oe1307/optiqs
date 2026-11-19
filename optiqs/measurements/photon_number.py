@@ -247,7 +247,9 @@ def _normalized_weights(
     return raw / total, raw
 
 
-def photon_number_probabilities(state: Qobj, mode: int = 0) -> np.ndarray:
+def photon_number_probabilities(
+    state: Qobj, mode: int = 0, *, eta: float = 0.0
+) -> np.ndarray:
     """Return normalized probabilities of measuring 0, 1, ..., cutoff-1 photons.
 
     ``state`` may be a ket, bra, or density operator with NumPy, SciPy CSR, or
@@ -259,14 +261,36 @@ def photon_number_probabilities(state: Qobj, mode: int = 0) -> np.ndarray:
     not the full positive semidefiniteness/Hermiticity of the operator.
     The input is not modified.  No large measurement projectors are built.
 
+    ``eta`` is the detector *loss probability*: 0 means ideal detection and
+    1 means all photons are lost. For nonzero loss, apply binomial thinning to
+    the marginal distribution directly, without building a lossy density
+    matrix. This has the same statistics as
+    ``photon_loss(state, eta=1-eta, mode=mode)`` followed by ideal detection.
+
     Complexity: O(D) for dense ket or density diagonal (D = total Hilbert
     dimension); O(nnz log D + cutoff) for extremely sparse CSR ket, otherwise
     O(D + nnz + cutoff); O(D + nnz + cutoff) for CSR density operators;
     O(nnz + cutoff) for CSR bra.  No sparse *state matrix* is densified.
     CUDA/MPS torch probabilities are reduced on device.
     """
+    # Imported lazily because the joint-number module already imports the
+    # no-loss weight routines above. Reuse its validated, cached binomial
+    # kernel rather than maintaining an independent implementation.
+    from optiqs.measurements.joint_photon_number import _loss_kernel, _loss_probability
+
+    eta = _loss_probability(eta)
     dim, stride = _geometry(state, mode)
-    return _normalized_weights(state, dim, stride)[0]
+    probabilities = _normalized_weights(state, dim, stride)[0]
+    if eta == 0.0:
+        return probabilities
+    if eta == 1.0:
+        result = np.zeros_like(probabilities)
+        result[0] = 1.0
+        return result
+    result = _loss_kernel(dim, eta) @ probabilities
+    # Compensate for rounding in the columns of the binomial kernel.
+    result /= result.sum(dtype=np.float64)
+    return result
 
 
 pnrd = photon_number_probabilities

@@ -1,4 +1,8 @@
-from optiqs.core.apply_local import apply_local
+from optiqs.core.apply_local import (
+    SparseKetLocalPlan,
+    apply_local,
+    apply_local_sequence,
+)
 from optiqs.core.expect import expect, variance
 from optiqs.core.expm import Expm
 from optiqs.core.fidelity import fidelity
@@ -12,7 +16,9 @@ __all__ = [
     "LazyCacheInfo",
     "LazyCachedOperator",
     "Qobj",
+    "SparseKetLocalPlan",
     "apply_local",
+    "apply_local_sequence",
     "expect",
     "fidelity",
     "load_state",

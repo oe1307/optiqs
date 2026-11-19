@@ -519,7 +519,9 @@ class LazyCachedOperator:
                 raise ValueError("LazyCachedOperator @ Qobj dimensions do not match")
             output = self._apply_rows(data, transpose=False)
             dims = (self.dims[0], other.dims[1])
-        return Qobj(
+        # _apply_rows creates an independent result (including the transposed
+        # right-action view); there is no need to clone its buffer again.
+        return Qobj._from_owned_data(
             output, dims=dims, qtype=other.qtype, tol=max(self._tol, other._tol)
         )
 

@@ -157,7 +157,9 @@ class Expm:
             output = _expm_action(self._data, other_data)
             dims = (self.dims[0], other.dims[1])
 
-        return Qobj(
+        # _expm_action always computes a new output buffer. Adopting it
+        # avoids copying a potentially large dense or CSR exponential result.
+        return Qobj._from_owned_data(
             output,
             dims=dims,
             qtype=other.qtype,
