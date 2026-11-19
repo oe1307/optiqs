@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from enum import StrEnum
+from enum import Enum
 from numbers import Integral, Number
 from os import PathLike
 from types import NotImplementedType
@@ -18,10 +18,13 @@ if TYPE_CHECKING:
     import torch
 
 
-class Qtype(StrEnum):
+class Qtype(str, Enum):
     ket = "ket"
     bra = "bra"
     oper = "oper"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class Qobj:

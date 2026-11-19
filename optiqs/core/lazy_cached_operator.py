@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from numbers import Integral, Real
 from threading import RLock
 from types import NotImplementedType
-from typing import Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import numpy as np
 from scipy import sparse
@@ -32,7 +32,10 @@ from optiqs.core.expm import Expm
 from optiqs.core.q_obj import Qobj, Qtype
 
 # Use a concrete two-dimensional CSR type for SciPy stub compatibility.
-_MatrixData: TypeAlias = np.ndarray | sparse.csr_array[Any, tuple[int, int]]
+if TYPE_CHECKING:
+    _MatrixData: TypeAlias = np.ndarray | sparse.csr_array[Any, tuple[int, int]]
+else:
+    _MatrixData: TypeAlias = np.ndarray | sparse.csr_array
 
 
 @dataclass(frozen=True)
