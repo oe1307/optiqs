@@ -1,7 +1,7 @@
 # OPTical Quantum Sdk
 
 <div align="center">
-  <img src=https://github.com/user-attachments/assets/4c7c2829-d4e0-4bd1-80f5-12401b2c833a width=600px>
+  <img width="543" height="181" alt="optiqs" src="https://github.com/user-attachments/assets/e58501a3-93cb-4825-8272-b121cd70783e" />
   <h3>Efficient, low-memory simulation of photonic quantum systems with sparse matrices</h3>
 
   <img src="https://img.shields.io/github/license/oe1307/optiqs?logo=open-source-initiative&logoColor=green">
