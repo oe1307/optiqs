@@ -199,7 +199,9 @@ def _apply_sparse_by_lost(
     return output
 
 
-def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_array:
+def _apply_sparse(
+    data: csr_array, dim: int, stride: int, eta: float, *, accelerator: str = "numpy"
+) -> csr_array:
     """Expand occupied (row, col) entries into Kraus transitions once.
 
     Each entry (n, m) contributes only for lost=0..min(n, m). Generating
@@ -210,8 +212,18 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
     # With many occupied matrix entries and a small Fock cutoff, the
     # pre-existing per-Kraus-term kernel is cheaper than constructing and
     # exponentiating all individual COO transitions. Preserve that path.
-    if dim <= 24 and data.nnz >= 4096:
+    if accelerator == "numpy" and dim <= 24 and data.nnz >= 4096:
         return _apply_sparse_by_lost(data, dim, stride, eta)
+
+    sparse_loss_kernel = None
+    if accelerator == "numba":
+        try:
+            from optiqs.channels._photon_loss_numba import sparse_loss_transitions
+        except ImportError as exc:
+            raise ImportError(
+                "The Numba photon-loss accelerator requires 'pip install OptiQS[jit]'"
+            ) from exc
+        sparse_loss_kernel = sparse_loss_transitions
 
     coo = data.tocoo(copy=False)
     rows, cols, values = coo.row, coo.col, coo.data
@@ -242,31 +254,45 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
                 )
             ),
         )
-        sizes = counts[start:stop]
-        # Map each Kraus transition back to its occupied source entry.
-        parents = np.repeat(np.arange(start, stop, dtype=np.intp), sizes)
-        starts = np.repeat(np.cumsum(sizes, dtype=np.int64) - sizes, sizes)
-        lost = np.arange(parents.size, dtype=np.int64) - starts
-        nr = row_photons[parents]
-        nc = col_photons[parents]
-        log_weight = 0.5 * (
-            log_factorials[nr]
-            + log_factorials[nc]
-            - 2 * log_factorials[lost]
-            - log_factorials[nr - lost]
-            - log_factorials[nc - lost]
-            + (nr + nc - 2 * lost) * log_eta
-            + 2 * lost * log_loss
-        )
-        contributions = values[parents] * np.exp(log_weight)
-        nonzero = contributions != 0
-        if np.any(nonzero):
+        if sparse_loss_kernel is not None:
+            out_rows, out_cols, out_values = sparse_loss_kernel(
+                rows[start:stop],
+                cols[start:stop],
+                values[start:stop].astype(dtype, copy=False),
+                row_photons[start:stop],
+                col_photons[start:stop],
+                counts[start:stop],
+                log_factorials,
+                log_eta,
+                log_loss,
+                stride,
+            )
+        else:
+            sizes = counts[start:stop]
+            # Map each Kraus transition back to its occupied source entry.
+            parents = np.repeat(np.arange(start, stop, dtype=np.intp), sizes)
+            starts = np.repeat(np.cumsum(sizes, dtype=np.int64) - sizes, sizes)
+            lost = np.arange(parents.size, dtype=np.int64) - starts
+            nr = row_photons[parents]
+            nc = col_photons[parents]
+            log_weight = 0.5 * (
+                log_factorials[nr]
+                + log_factorials[nc]
+                - 2 * log_factorials[lost]
+                - log_factorials[nr - lost]
+                - log_factorials[nc - lost]
+                + (nr + nc - 2 * lost) * log_eta
+                + 2 * lost * log_loss
+            )
+            contributions = values[parents] * np.exp(log_weight)
+            nonzero = contributions != 0
             shift = lost[nonzero] * stride
+            out_rows = rows[parents[nonzero]] - shift
+            out_cols = cols[parents[nonzero]] - shift
+            out_values = contributions[nonzero].astype(dtype, copy=False)
+        if out_values.size:
             partial = csr_array(
-                (
-                    contributions[nonzero].astype(dtype, copy=False),
-                    (rows[parents[nonzero]] - shift, cols[parents[nonzero]] - shift),
-                ),
+                (out_values, (out_rows, out_cols)),
                 shape=data.shape,
             )
             output = output + partial
@@ -621,7 +647,9 @@ def _apply_vector_dense_torch(
     return columns.T @ columns.conj()
 
 
-def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
+def photon_loss(
+    state: Qobj, eta: float, mode: int = 0, *, accelerator: str = "numpy"
+) -> Qobj:
     """Apply the exact independent-environment pure-loss channel to one mode.
 
     ``eta`` is the *transmissivity* (photon survival probability); the loss
@@ -642,6 +670,12 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
         Power transmissivity in [0, 1]; 1 = no loss, 0 = complete loss.
     mode : int, optional
         Zero-based subsystem index of the lossy mode (default: 0).
+    accelerator : {'numpy', 'numba'}, optional
+        Select the sparse density-matrix transition engine. The default
+        ``'numpy'`` preserves the existing behavior. ``'numba'`` compiles a
+        bounded COO kernel on first use and requires the optional ``jit``
+        extra. Dense states, kets, and diagonal-only sparse states still
+        follow their existing specialized paths.
 
     Returns
     -------
@@ -664,6 +698,8 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
     """
     if not isinstance(state, Qobj):
         raise TypeError("state must be an optiqs.Qobj")
+    if accelerator not in ("numpy", "numba"):
+        raise ValueError("accelerator must be 'numpy' or 'numba'")
     if isinstance(eta, (bool, np.bool_)) or not isinstance(eta, Real):
         raise TypeError("eta must be a real number in [0, 1]")
     if not math.isfinite(eta) or not 0 <= eta <= 1:
@@ -717,7 +753,9 @@ def photon_loss(state: Qobj, eta: float, mode: int = 0) -> Qobj:
             elif _use_diagonal_fast_path(data, dim):
                 result = _apply_diagonal_sparse(data, dim, left, right, float(eta))
             else:
-                result = _apply_sparse(data, dim, right, float(eta))
+                result = _apply_sparse(
+                    data, dim, right, float(eta), accelerator=accelerator
+                )
     elif isinstance(data, np.ndarray):
         result = (
             _apply_zero_dense_numpy(data, dim, left, right)

@@ -131,12 +131,21 @@ def _upper_diagonals(
         # A few distant Fock levels must not trigger O(dim**2) scans.
         rows, cols, values = _upper_pairs(coeff, rho)
         offsets = cols - rows
-        for offset in np.unique(offsets):
-            mask = offsets == offset
-            active_rows = rows[mask]
+        if offsets.size == 0:
+            return diagonals
+        # Group once instead of scanning all nonzeros for each distinct
+        # superdiagonal. Stable sorting preserves the existing assignment
+        # order if an input contains duplicate coordinates.
+        order = np.argsort(offsets, kind="stable")
+        sorted_offsets = offsets[order]
+        boundaries = np.r_[0, np.flatnonzero(np.diff(sorted_offsets)) + 1, order.size]
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            offset = int(sorted_offsets[start])
+            group = order[start:stop]
+            active_rows = rows[group]
             diag = np.zeros(int(np.max(active_rows)) + 1, dtype=np.complex128)
-            diag[active_rows] = values[mask] * (2 if offset else 1)
-            diagonals[int(offset)] = diag
+            diag[active_rows] = values[group] * (2 if offset else 1)
+            diagonals[offset] = diag
         return diagonals
 
     for offset in range(dimension):

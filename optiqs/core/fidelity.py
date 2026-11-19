@@ -468,3 +468,94 @@ def fidelity(first: Qobj, second: Qobj, *, squared: bool = True) -> float:
         raise ValueError("States must be positive semidefinite")
     result = max(0.0, min(1.0, result))
     return result if squared else math.sqrt(result)
+
+
+class PreparedFidelityTarget:
+    """Precompute a NumPy/SciPy density target's matrix square root.
+
+    Use this when comparing many different states against the same *mixed*
+    target. The target is copied at construction and eigendecomposed once.
+    ``fidelity(other)`` follows the same squared-fidelity convention as the
+    module-level function; vectors use its cheaper quadratic-form path.
+
+    General targets need O(D**2) storage. A diagonal target instead caches
+    only O(D) square-root entries. PyTorch states are deliberately unsupported
+    by this optional CPU-only API; use ``fidelity`` for device tensors.
+    """
+
+    def __init__(self, target: Qobj) -> None:
+        if not isinstance(target, Qobj) or target.qtype != Qtype.oper:
+            raise TypeError("target must be a density-operator Qobj")
+        if target.dims[0] != target.dims[1]:
+            raise ValueError("density operator must have matching dimensions")
+        data = target._data
+        if not isinstance(data, (np.ndarray, sparse.csr_array)):
+            raise TypeError("PreparedFidelityTarget supports NumPy/SciPy only")
+        if not _finite(data) or not _hermitian(data):
+            raise ValueError("target must be finite and Hermitian")
+        self._trace = _positive_real(_scalar(data.diagonal().sum()), "target trace")
+        self._target = target.copy()
+        self._dims = target.dims[0]
+        diagonal = _diagonal_if_diagonal(data)
+        self._diagonal_roots: np.ndarray | None = None
+        self._basis: np.ndarray | None = None
+        if diagonal is not None:
+            self._diagonal_roots = np.sqrt(
+                _nonnegative_eigenvalues(diagonal, "target density operator")
+            )
+        else:
+            dense = data.toarray() if isinstance(data, sparse.csr_array) else data
+            eigenvalues, eigenvectors = np.linalg.eigh(dense)
+            eigenvalues = _nonnegative_eigenvalues(
+                eigenvalues, "target density operator"
+            )
+            active = eigenvalues > 0
+            self._basis = (
+                eigenvectors[:, active] * np.sqrt(eigenvalues[active])[None, :]
+            )
+
+    def fidelity(self, other: Qobj, *, squared: bool = True) -> float:
+        """Compare another state to the prepared target without re-diagonalizing."""
+        if not isinstance(other, Qobj):
+            raise TypeError("other must be a Qobj")
+        if not isinstance(squared, bool):
+            raise TypeError("squared must be a bool")
+        dims = (
+            other.dims[0]
+            if other.qtype == Qtype.ket
+            else other.dims[1]
+            if other.qtype == Qtype.bra
+            else other.dims[0]
+        )
+        if dims != self._dims or (
+            other.qtype == Qtype.oper and other.dims[0] != other.dims[1]
+        ):
+            raise ValueError("states must have matching Hilbert-space dimensions")
+        data = other._data
+        if not isinstance(data, (np.ndarray, sparse.csr_array)):
+            raise TypeError("PreparedFidelityTarget supports NumPy/SciPy only")
+        if other.is_vector():
+            return fidelity(self._target, other, squared=squared)
+        if not _finite(data) or not _hermitian(data):
+            raise ValueError("other density operator must be finite and Hermitian")
+        norm = _positive_real(_scalar(data.diagonal().sum()), "other trace")
+
+        if self._diagonal_roots is not None:
+            roots = self._diagonal_roots
+            dense = data.toarray() if isinstance(data, sparse.csr_array) else data
+            sandwich = (roots[:, None] * dense) * roots[None, :]
+        else:
+            assert self._basis is not None
+            sandwich = self._basis.conj().T @ (data @ self._basis)
+        sandwich = (sandwich + sandwich.conj().T) * 0.5
+        eigenvalues = _nonnegative_eigenvalues(
+            np.linalg.eigvalsh(sandwich), "density-operator product"
+        )
+        root = float(np.sqrt(eigenvalues).sum())
+        result = root * root / (self._trace * norm)
+        if not math.isfinite(result) or result < -1e-6 or result > 1 + 1e-6:
+            raise ValueError("states must be positive semidefinite")
+        result = max(0.0, min(1.0, result))
+        return result if squared else math.sqrt(result)
+
+    __call__ = fidelity

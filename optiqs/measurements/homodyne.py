@@ -9,7 +9,9 @@ no quadrature projectors or ket outer products are formed.
 
 from __future__ import annotations
 
+import hashlib
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from numbers import Integral
 
@@ -177,6 +179,78 @@ def _hermite_basis(
     return basis
 
 
+class HomodyneBasisCache:
+    """Bounded LRU cache of Hermite bases for repeated quadrature grids.
+
+    Pass the same instance as ``basis_cache=`` when evaluating multiple
+    density operators on the same ``xvec``, cutoff, ``hbar`` and chunk size.
+    Entries are read-only and validated against the *actual grid values*;
+    mutating the caller's x-array cannot result in stale basis values.
+    The cache never retains more than ``max_bytes`` of grid/basis arrays.
+    Pure single-angle kets still use the lower-memory recurrence directly.
+    """
+
+    def __init__(self, max_bytes: int = 64 * 1024 * 1024) -> None:
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, Integral)
+            or max_bytes < 1
+        ):
+            raise ValueError("max_bytes must be a positive integer")
+        self.max_bytes: int = int(max_bytes)
+        self._bytes: int = 0
+        self._entries: OrderedDict[
+            tuple[int, float, int, bytes],
+            tuple[NDArray[np.float64], NDArray[np.float64]],
+        ] = OrderedDict()
+
+    def clear(self) -> None:
+        """Release all cached basis arrays."""
+        self._entries.clear()
+        self._bytes = 0
+
+    def basis(
+        self, x: NDArray[np.float64], cutoff: int, hbar: float
+    ) -> NDArray[np.float64]:
+        """Return a cached read-only basis or evaluate it on a cache miss."""
+        # Avoid hashing for trivial recurrence sizes and for entries larger
+        # than the entire budget. Include grid bytes *and* values of the
+        # remaining recurrence parameters in the key.
+        size = (cutoff + 1) * x.size * np.dtype(np.float64).itemsize
+        if cutoff < 8 or size > self.max_bytes:
+            return _hermite_basis(x, cutoff, hbar)
+        fingerprint = hashlib.blake2b(x.tobytes(), digest_size=16).digest()
+        key = (cutoff, hbar, x.size, fingerprint)
+        hit = self._entries.get(key)
+        if hit is not None and np.array_equal(hit[0], x):
+            self._entries.move_to_end(key)
+            return hit[1]
+        if hit is not None:
+            self._bytes -= hit[0].nbytes + hit[1].nbytes
+            del self._entries[key]
+        grid = np.array(x, dtype=np.float64, copy=True)
+        basis = _hermite_basis(grid, cutoff, hbar)
+        grid.setflags(write=False)
+        basis.setflags(write=False)
+        while self._entries and self._bytes + size > self.max_bytes:
+            _, (old_grid, old_basis) = self._entries.popitem(last=False)
+            self._bytes -= old_grid.nbytes + old_basis.nbytes
+        self._entries[key] = (grid, basis)
+        self._bytes += size
+        return basis
+
+
+def _basis(
+    x: NDArray[np.float64],
+    cutoff: int,
+    hbar: float,
+    cache: HomodyneBasisCache | None,
+) -> NDArray[np.float64]:
+    if cache is None:
+        return _hermite_basis(x, cutoff, hbar)
+    return cache.basis(x, cutoff, hbar)
+
+
 def _pure_pdf(
     coefficients: NDArray[np.complex128],
     x: NDArray[np.float64],
@@ -217,6 +291,7 @@ def _mixed_pdf(
     theta: float,
     hbar: float,
     chunk_size: int,
+    basis_cache: HomodyneBasisCache | None = None,
 ) -> NDArray[np.float64]:
     """Evaluate <x_theta|rho|x_theta> in bounded-size batches."""
     out = np.empty(x.size, dtype=np.float64)
@@ -226,7 +301,7 @@ def _mixed_pdf(
     batch_size = max(1, min(chunk_size, 1_000_000 // cutoff))
     for start in range(0, x.size, batch_size):
         stop = min(start + batch_size, x.size)
-        basis = _hermite_basis(x[start:stop], cutoff, hbar)
+        basis = _basis(x[start:stop], cutoff, hbar, basis_cache)
         rotated = basis if phase is None else phase[:, None] * basis
         result = density @ rotated
         out[start:stop] = (
@@ -244,6 +319,7 @@ def _sparse_angle_fourier(
     hbar: float,
     batch_size: int,
     trace: float,
+    basis_cache: HomodyneBasisCache | None = None,
 ) -> NDArray[np.float64]:
     """Contract only occupied density diagonals once for all angles.
 
@@ -275,7 +351,7 @@ def _sparse_angle_fourier(
 
     for start in range(0, x.size, batch_size):
         stop = min(start + batch_size, x.size)
-        basis = _hermite_basis(x[start:stop], cutoff, hbar)
+        basis = _basis(x[start:stop], cutoff, hbar, basis_cache)
         coefficients = np.empty((unique.size, stop - start), dtype=np.complex128)
         for k, (begin, count) in enumerate(zip(beginnings, sizes)):
             segment = slice(int(begin), int(begin + count))
@@ -312,6 +388,7 @@ def _pdf(
     theta: float,
     hbar: float,
     chunk_size: int,
+    basis_cache: HomodyneBasisCache | None = None,
 ) -> NDArray[np.float64]:
     if prepared.coefficients is not None:
         result = _pure_pdf(prepared.coefficients, x, theta, hbar, chunk_size)
@@ -325,6 +402,7 @@ def _pdf(
             theta,
             hbar,
             chunk_size,
+            basis_cache,
         )
     return _nonnegative_pdf(result)
 
@@ -337,6 +415,7 @@ def homodyne_probabilities(
     theta: float = 0.0,
     hbar: float = 1.0,
     chunk_size: int = 4096,
+    basis_cache: HomodyneBasisCache | None = None,
 ) -> NDArray[np.float64]:
     """Return the ideal homodyne *probability density* p(x | theta).
 
@@ -365,7 +444,9 @@ def homodyne_probabilities(
     chunk_size = _positive_integer(chunk_size, "chunk_size")
     x = _points(xvec)
     prepared = _prepare(state, mode)
-    return _pdf(prepared, x, theta, hbar, chunk_size)
+    if basis_cache is not None and not isinstance(basis_cache, HomodyneBasisCache):
+        raise TypeError("basis_cache must be a HomodyneBasisCache or None")
+    return _pdf(prepared, x, theta, hbar, chunk_size, basis_cache)
 
 
 def homodyne_probabilities_angles(
@@ -376,6 +457,7 @@ def homodyne_probabilities_angles(
     *,
     hbar: float = 1.0,
     chunk_size: int = 4096,
+    basis_cache: HomodyneBasisCache | None = None,
 ) -> NDArray[np.float64]:
     """Evaluate homodyne PDFs at many angles, sharing the Hermite basis.
 
@@ -405,6 +487,8 @@ def homodyne_probabilities_angles(
     )
     hbar = _real_parameter(hbar, "hbar", positive=True)
     chunk_size = _positive_integer(chunk_size, "chunk_size")
+    if basis_cache is not None and not isinstance(basis_cache, HomodyneBasisCache):
+        raise TypeError("basis_cache must be a HomodyneBasisCache or None")
     x = _points(xvec)
     prepared = _prepare(state, mode)
     cutoff = prepared.cutoff
@@ -421,14 +505,21 @@ def homodyne_probabilities_angles(
         )
         for start in range(0, x.size, batch_size):
             stop = min(start + batch_size, x.size)
-            basis = _hermite_basis(x[start:stop], cutoff, hbar)
+            basis = _basis(x[start:stop], cutoff, hbar, basis_cache)
             results[:, start:stop] = np.abs(coefficients @ basis) ** 2
     else:
         density = prepared.density
         assert density is not None
         if isinstance(density, csr_array) and angles.size >= 8 and cutoff >= 8:
             results = _sparse_angle_fourier(
-                density, angles, x, cutoff, hbar, batch_size, prepared.trace
+                density,
+                angles,
+                x,
+                cutoff,
+                hbar,
+                batch_size,
+                prepared.trace,
+                basis_cache,
             )
         elif isinstance(density, np.ndarray) and angles.size >= 8 and cutoff >= 8:
             # Dense mixed state: collect each upper diagonal of rho into an
@@ -441,7 +532,7 @@ def homodyne_probabilities_angles(
             phases = np.exp(1j * angles[:, None] * indices[None, 1:])
             for start in range(0, x.size, batch_size):
                 stop = min(start + batch_size, x.size)
-                basis = _hermite_basis(x[start:stop], cutoff, hbar)
+                basis = _basis(x[start:stop], cutoff, hbar, basis_cache)
                 fourier = np.empty((cutoff, stop - start), dtype=np.complex128)
                 for offset in range(cutoff):
                     diagonal = np.diagonal(density, offset=offset)
@@ -466,7 +557,7 @@ def homodyne_probabilities_angles(
             phase = np.exp(1j * angles[:, None] * indices[None, :])
             for start in range(0, x.size, batch_size):
                 stop = min(start + batch_size, x.size)
-                basis = _hermite_basis(x[start:stop], cutoff, hbar)
+                basis = _basis(x[start:stop], cutoff, hbar, basis_cache)
                 for i in range(angles.size):
                     rotated = phase[i, :, None] * basis
                     applied = density @ rotated
@@ -492,6 +583,7 @@ def measure_homodyne(
     grid_size: int = 4096,
     chunk_size: int = 4096,
     rng: np.random.Generator | int | None = None,
+    basis_cache: HomodyneBasisCache | None = None,
 ) -> float | NDArray[np.float64]:
     """Sample ideal continuous-valued homodyne outcomes via inverse CDF.
 
@@ -530,7 +622,9 @@ def measure_homodyne(
     else:
         x = _points(xvec, increasing=True)
 
-    pdf = _pdf(prepared, x, theta, hbar, chunk_size)
+    if basis_cache is not None and not isinstance(basis_cache, HomodyneBasisCache):
+        raise TypeError("basis_cache must be a HomodyneBasisCache or None")
+    pdf = _pdf(prepared, x, theta, hbar, chunk_size, basis_cache)
     dx = np.diff(x)
     interval_masses = 0.5 * (pdf[1:] + pdf[:-1]) * dx
     cdf = np.empty(x.size, dtype=np.float64)

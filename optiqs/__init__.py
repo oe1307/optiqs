@@ -3,6 +3,8 @@ from optiqs.core import (
     Expm,
     LazyCachedOperator,
     LazyCacheInfo,
+    LowRankDensity,
+    PreparedFidelityTarget,
     Qobj,
     SparseKetLocalPlan,
     apply_local,
@@ -10,11 +12,13 @@ from optiqs.core import (
     expect,
     fidelity,
     load_state,
+    photon_loss_low_rank,
     save_state,
     tensor,
     variance,
 )
 from optiqs.measurements import (
+    HomodyneBasisCache,
     homodyne_probabilities,
     homodyne_probabilities_angles,
     iter_joint_photon_number_branches,
@@ -63,8 +67,11 @@ from optiqs.utils import _to_numpy_dtype, get_device
 
 __all__ = [
     "Expm",
+    "HomodyneBasisCache",
     "LazyCacheInfo",
     "LazyCachedOperator",
+    "LowRankDensity",
+    "PreparedFidelityTarget",
     "Qobj",
     "SparseKetLocalPlan",
     "WignerGrid",
@@ -100,6 +107,7 @@ __all__ = [
     "number",
     "phase_shift",
     "photon_loss",
+    "photon_loss_low_rank",
     "photon_number_probabilities",
     "pnrd",
     "post_select",

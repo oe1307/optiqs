@@ -568,12 +568,10 @@ def apply_local(
         and state_data.nnz <= 4096
         and math.prod(required) <= 4096
         and gate_data.nnz <= 200_000
+        # Bound the expected number of COO entries before allocating them.
+        and state_data.nnz * max(1, gate_data.nnz // gate_data.shape[1]) <= 262_144
     ):
-        plan = SparseKetLocalPlan(gate, subsystem_dims, selected)
-        # Sum the numbers of nonzeros in precisely the gate columns that
-        # the ket touches; avoid a potentially huge COO output allocation.
-        if state_data.nnz * max(1, gate_data.nnz // gate_data.shape[1]) <= 262_144:
-            return plan(state)
+        return SparseKetLocalPlan(gate, subsystem_dims, selected)(state)
 
     if state.qtype == Qtype.bra:
         return _apply_rows(state.dag(), gate, selected).dag()
@@ -583,18 +581,106 @@ def apply_local(
     return _apply_rows(intermediate.dag(), gate, selected).dag()
 
 
+def _apply_fused_diagonals(
+    state: Qobj,
+    operations: list[tuple[Qobj, tuple[int, ...], np.ndarray]],
+) -> Qobj:
+    """One state traversal for commuting phase gates on arbitrary modes."""
+    data = state._data
+    if not isinstance(data, (np.ndarray, sparse.csr_array)):
+        # Preserve backend mismatch checks from apply_local, including Torch.
+        result = state
+        for gate, modes, _ in operations:
+            result = apply_local(result, gate, modes)
+        return result
+
+    # Reduce repeated gates on the same ordered subset in the small local
+    # Hilbert space, without ever constructing a full-space diagonal gate.
+    groups: dict[tuple[int, ...], np.ndarray] = {}
+    for _, modes, diagonal in operations:
+        if modes in groups:
+            groups[modes] *= diagonal
+        else:
+            groups[modes] = np.array(diagonal, copy=True)
+    dtype = np.result_type(
+        data.dtype, *(diagonal.dtype for diagonal in groups.values())
+    )
+
+    output: np.ndarray | sparse.csr_array
+    if isinstance(data, np.ndarray):
+        output = np.array(data, dtype=dtype, copy=True)
+        if state.qtype == Qtype.bra:
+            indices = np.arange(data.shape[1], dtype=np.intp)
+            for modes, diagonal in groups.items():
+                local = _extract_flat_index(indices, state.dims[1], modes)
+                output *= np.conjugate(diagonal[local])[None, :]
+        else:
+            indices = np.arange(data.shape[0], dtype=np.intp)
+            for modes, diagonal in groups.items():
+                local = _extract_flat_index(indices, state.dims[0], modes)
+                output *= diagonal[local, None]
+            if state.qtype == Qtype.oper:
+                cols = np.arange(data.shape[1], dtype=np.intp)
+                for modes, diagonal in groups.items():
+                    local = _extract_flat_index(cols, state.dims[1], modes)
+                    output *= np.conjugate(diagonal[local])[None, :]
+    else:
+        values = np.array(data.data, dtype=dtype, copy=True)
+        if state.qtype == Qtype.bra:
+            for modes, diagonal in groups.items():
+                local = _extract_flat_index(data.indices, state.dims[1], modes)
+                values *= np.conjugate(diagonal[local])
+        else:
+            if data.nnz < max(1, data.shape[0] // 100):
+                rows = np.searchsorted(
+                    data.indptr[1:],
+                    np.arange(data.nnz, dtype=data.indptr.dtype),
+                    side="right",
+                )
+            else:
+                rows = np.repeat(
+                    np.arange(data.shape[0], dtype=data.indptr.dtype),
+                    np.diff(data.indptr),
+                )
+            for modes, diagonal in groups.items():
+                local = _extract_flat_index(rows, state.dims[0], modes)
+                values *= diagonal[local]
+            if state.qtype == Qtype.oper:
+                for modes, diagonal in groups.items():
+                    local = _extract_flat_index(data.indices, state.dims[1], modes)
+                    values *= np.conjugate(diagonal[local])
+        output = sparse.csr_array(
+            (values, data.indices.copy(), data.indptr.copy()), shape=data.shape
+        )
+
+    return Qobj._from_owned_data(
+        output,
+        dims=state.dims,
+        qtype=state.qtype,
+        tol=max(state._tol, *(gate._tol for gate, _, _ in operations)),
+    )
+
+
 def apply_local_sequence(
     state: Qobj,
     operations: Iterable[tuple[LocalGate, int | Sequence[int]]],
+    *,
+    cache_sparse_plans: bool = True,
 ) -> Qobj:
-    """Apply local operations in order, fusing adjacent diagonal phase gates.
+    """Apply local operations in order, fusing consecutive diagonal phases.
 
-    Only consecutive, unit-modulus NumPy/CSR diagonal operators targeting
-    exactly the same ordered modes are fused. All other gates, including
-    nonunitary diagonal Kraus operators, follow the normal ``apply_local``
-    path. This opt-in convenience function avoids repeated state traversals
-    without materializing global operators; the usual rounding differences
-    from changing the order of floating-point products may remain.
+    Consecutive unit-modulus NumPy/CSR diagonal operators commute even when
+    they act on different modes. They are contracted in one pass over the
+    state. Nonunitary diagonals and non-diagonal gates still follow the
+    normal ``apply_local`` path. As with same-mode fusion, changing the order
+    of floating-point products may produce tiny rounding differences.
+
+    With ``cache_sparse_plans=True``, repeated non-diagonal CSR gates acting
+    on sparse kets reuse one ``SparseKetLocalPlan`` per gate/mode combination
+    for the duration of this call. No global cache is retained, and the
+    compiled plan uses the gate values at its *first* application. Disable
+    this option if you intentionally mutate private ``gate._data`` during
+    iteration over ``operations``.
 
     Examples
     --------
@@ -603,30 +689,54 @@ def apply_local_sequence(
     ...     (phase_shift(8, 0.3), 0),
     ... ])
     """
-    pending: Qobj | None = None
-    pending_modes: tuple[int, ...] = ()
-    pending_diagonal: np.ndarray | None = None
-    pending_count = 0
-    pending_tol = 0.0
+    if not isinstance(cache_sparse_plans, bool):
+        raise TypeError("cache_sparse_plans must be a bool")
+    pending: list[tuple[Qobj, tuple[int, ...], np.ndarray]] = []
+    plans: dict[
+        tuple[int, tuple[int, ...], tuple[int, ...]],
+        tuple[Qobj, SparseKetLocalPlan],
+    ] = {}
+
+    def apply(current: Qobj, gate: LocalGate, modes: int | Sequence[int]) -> Qobj:
+        data = current._data
+        if (
+            cache_sparse_plans
+            and current.qtype == Qtype.ket
+            and isinstance(data, sparse.csr_array)
+            and isinstance(gate, Qobj)
+            and isinstance(gate._data, sparse.csr_array)
+            and data.nnz <= 4096
+            and gate._data.nnz <= 200_000
+        ):
+            selected = _selected_modes(modes, len(current.dims[0]))
+            required = tuple(current.dims[0][i] for i in selected)
+            local_size = math.prod(required)
+            if (
+                gate.qtype == Qtype.oper
+                and gate.dims == (required, required)
+                and local_size <= 4096
+                and data.nnz * max(1, gate._data.nnz // gate._data.shape[1]) <= 262_144
+            ):
+                key = (id(gate), selected, current.dims[0])
+                entry = plans.get(key)
+                if entry is None or entry[0] is not gate:
+                    entry = (
+                        gate,
+                        SparseKetLocalPlan(gate, current.dims[0], selected),
+                    )
+                    plans[key] = entry
+                return entry[1](current)
+        return apply_local(current, gate, modes)
 
     def flush(current: Qobj) -> Qobj:
-        nonlocal pending, pending_diagonal, pending_count
-        if pending is None:
+        if not pending:
             return current
-        if pending_count == 1:
-            result = apply_local(current, pending, pending_modes)
+        if len(pending) == 1:
+            gate, modes, _ = pending[0]
+            result = apply(current, gate, modes)
         else:
-            assert pending_diagonal is not None
-            fused = Qobj(
-                sparse.diags_array(pending_diagonal, offsets=0, format="csr"),
-                dims=pending.dims,
-                qtype=Qtype.oper,
-                tol=pending_tol,
-            )
-            result = apply_local(current, fused, pending_modes)
-        pending = None
-        pending_diagonal = None
-        pending_count = 0
+            result = _apply_fused_diagonals(current, pending)
+        pending.clear()
         return result
 
     current = state
@@ -635,7 +745,7 @@ def apply_local_sequence(
         # operations that cannot safely join the pending fusion group.
         if not isinstance(gate, Qobj):
             current = flush(current)
-            current = apply_local(current, gate, modes)
+            current = apply(current, gate, modes)
             continue
         dims = current.dims[1] if current.qtype == Qtype.bra else current.dims[0]
         selected = _selected_modes(modes, len(dims))
@@ -649,22 +759,7 @@ def apply_local_sequence(
             or not np.all(np.abs(np.abs(diagonal) - 1.0) <= 1e-14)
         ):
             current = flush(current)
-            current = apply_local(current, gate, selected)
+            current = apply(current, gate, selected)
             continue
-        if pending is not None and (
-            pending_modes != selected or pending.dims != gate.dims
-        ):
-            current = flush(current)
-        if pending is None:
-            pending = gate
-            pending_modes = selected
-            pending_diagonal = np.array(diagonal, copy=True)
-            pending_count = 1
-            pending_tol = gate._tol
-        else:
-            assert pending_diagonal is not None
-            # Promote real diagonals if a following phase gate is complex.
-            pending_diagonal = pending_diagonal * diagonal
-            pending_count += 1
-            pending_tol = max(pending_tol, gate._tol)
+        pending.append((gate, selected, diagonal))
     return flush(current)

@@ -1,4 +1,5 @@
 from optiqs.measurements.homodyne import (
+    HomodyneBasisCache,
     homodyne_probabilities,
     homodyne_probabilities_angles,
     measure_homodyne,
@@ -20,6 +21,7 @@ from optiqs.measurements.photon_number import (
 from optiqs.measurements.post_selection import post_select, postselect_photon_number
 
 __all__ = [
+    "HomodyneBasisCache",
     "homodyne_probabilities",
     "homodyne_probabilities_angles",
     "iter_joint_photon_number_branches",
