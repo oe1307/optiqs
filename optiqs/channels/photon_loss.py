@@ -101,10 +101,10 @@ def _apply_dense_numpy(
     return output
 
 
-# Avoid rebuilding the output CSR for every Kraus term while keeping
-# buffered COO entries bounded for states with many occupied Fock levels.
-_SPARSE_LOSS_BATCH_TERMS = 5
+# Build a bounded set of COO transitions at a time. This is a cap on the
+# *generated* transitions, rather than on the number of original CSR entries.
 _SPARSE_LOSS_BATCH_MAX_ENTRIES = 250_000
+_SPARSE_LOSS_BATCH_TERMS = 32
 
 
 def _apply_zero_sparse(data: csr_array, dim: int, stride: int) -> csr_array:
@@ -118,8 +118,6 @@ def _apply_zero_sparse(data: csr_array, dim: int, stride: int) -> csr_array:
     col_numbers = (coo.col // stride) % dim
     same_number = row_numbers == col_numbers
     offset = row_numbers[same_number] * stride
-    # COO construction combines entries from different original photon
-    # numbers that map onto the same vacuum output coordinate.
     return csr_array(
         (
             coo.data[same_number].astype(dtype, copy=False),
@@ -129,7 +127,9 @@ def _apply_zero_sparse(data: csr_array, dim: int, stride: int) -> csr_array:
     )
 
 
-def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_array:
+def _apply_sparse_by_lost(
+    data: csr_array, dim: int, stride: int, eta: float
+) -> csr_array:
     """Shift occupied entries and combine bounded groups of Kraus terms."""
     matrix = data.tocoo()
     rows, cols, values = matrix.row, matrix.col, matrix.data
@@ -196,6 +196,81 @@ def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_arr
         ):
             flush_batch()
     flush_batch()
+    return output
+
+
+def _apply_sparse(data: csr_array, dim: int, stride: int, eta: float) -> csr_array:
+    """Expand occupied (row, col) entries into Kraus transitions once.
+
+    Each entry (n, m) contributes only for lost=0..min(n, m). Generating
+    these transitions directly avoids rescanning *every* nonzero for each
+    global loss term. COO duplicates are combined by the CSR constructor.
+    A prefix-sum partition bounds working memory for large sparse states.
+    """
+    # With many occupied matrix entries and a small Fock cutoff, the
+    # pre-existing per-Kraus-term kernel is cheaper than constructing and
+    # exponentiating all individual COO transitions. Preserve that path.
+    if dim <= 24 and data.nnz >= 4096:
+        return _apply_sparse_by_lost(data, dim, stride, eta)
+
+    coo = data.tocoo(copy=False)
+    rows, cols, values = coo.row, coo.col, coo.data
+    dtype = data.dtype if data.dtype.kind in "fc" else np.float64
+    output = csr_array(data.shape, dtype=dtype)
+    if coo.nnz == 0:
+        return output
+
+    row_photons = (rows // stride) % dim
+    col_photons = (cols // stride) % dim
+    counts = (np.minimum(row_photons, col_photons) + 1).astype(np.int64)
+    cumulative = np.cumsum(counts, dtype=np.int64)
+    log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+    log_eta, log_loss = math.log(eta), math.log1p(-eta)
+
+    start = 0
+    while start < coo.nnz:
+        previous = int(cumulative[start - 1]) if start else 0
+        # Avoid splitting any one input entry. A single entry may exceed the
+        # cap for a very large local Fock cutoff, but all other batches fit.
+        stop = max(
+            start + 1,
+            int(
+                np.searchsorted(
+                    cumulative,
+                    previous + _SPARSE_LOSS_BATCH_MAX_ENTRIES,
+                    side="right",
+                )
+            ),
+        )
+        sizes = counts[start:stop]
+        # Map each Kraus transition back to its occupied source entry.
+        parents = np.repeat(np.arange(start, stop, dtype=np.intp), sizes)
+        starts = np.repeat(np.cumsum(sizes, dtype=np.int64) - sizes, sizes)
+        lost = np.arange(parents.size, dtype=np.int64) - starts
+        nr = row_photons[parents]
+        nc = col_photons[parents]
+        log_weight = 0.5 * (
+            log_factorials[nr]
+            + log_factorials[nc]
+            - 2 * log_factorials[lost]
+            - log_factorials[nr - lost]
+            - log_factorials[nc - lost]
+            + (nr + nc - 2 * lost) * log_eta
+            + 2 * lost * log_loss
+        )
+        contributions = values[parents] * np.exp(log_weight)
+        nonzero = contributions != 0
+        if np.any(nonzero):
+            shift = lost[nonzero] * stride
+            partial = csr_array(
+                (
+                    contributions[nonzero].astype(dtype, copy=False),
+                    (rows[parents[nonzero]] - shift, cols[parents[nonzero]] - shift),
+                ),
+                shape=data.shape,
+            )
+            output = output + partial
+        start = stop
     return output
 
 

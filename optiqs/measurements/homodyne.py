@@ -236,6 +236,64 @@ def _mixed_pdf(
     return out
 
 
+def _sparse_angle_fourier(
+    density: csr_array,
+    angles: NDArray[np.float64],
+    x: NDArray[np.float64],
+    cutoff: int,
+    hbar: float,
+    batch_size: int,
+    trace: float,
+) -> NDArray[np.float64]:
+    """Contract only occupied density diagonals once for all angles.
+
+    P(x, theta) is a Fourier series in theta. For sparse density operators,
+    its coefficients are themselves sparse sums over populated diagonals.
+    Symmetrization matches the real-valued contraction for density matrices
+    passing the existing approximate-Hermiticity validation.
+    """
+    from scipy import sparse
+
+    symmetric = (density + density.conj().T) * 0.5
+    upper = sparse.triu(symmetric, format="coo")
+    valid = upper.data != 0
+    rows, cols, values = upper.row[valid], upper.col[valid], upper.data[valid]
+    offsets = cols - rows
+    order = np.argsort(offsets, kind="stable")
+    rows, cols, values, offsets = (
+        rows[order],
+        cols[order],
+        values[order],
+        offsets[order],
+    )
+    unique, beginnings, sizes = np.unique(
+        offsets, return_index=True, return_counts=True
+    )
+    result = np.empty((angles.size, x.size), dtype=np.float64)
+    positive = unique > 0
+    phasors = np.exp(1j * angles[:, None] * unique[positive][None, :])
+
+    for start in range(0, x.size, batch_size):
+        stop = min(start + batch_size, x.size)
+        basis = _hermite_basis(x[start:stop], cutoff, hbar)
+        coefficients = np.empty((unique.size, stop - start), dtype=np.complex128)
+        for k, (begin, count) in enumerate(zip(beginnings, sizes)):
+            segment = slice(int(begin), int(begin + count))
+            coefficients[k] = np.einsum(
+                "n,nx,nx->x",
+                values[segment],
+                basis[rows[segment]],
+                basis[cols[segment]],
+                optimize=False,
+            )
+        # A physical nonzero-trace density operator always has a diagonal.
+        diagonal = coefficients[unique == 0].real.sum(axis=0)
+        result[:, start:stop] = (
+            diagonal[None, :] + 2.0 * (phasors @ coefficients[positive]).real
+        ) / trace
+    return result
+
+
 def _nonnegative_pdf(result: NDArray[np.float64]) -> NDArray[np.float64]:
     """Apply the same numerical checks to single- and multi-angle PDFs."""
     if not np.all(np.isfinite(result)):
@@ -325,8 +383,10 @@ def homodyne_probabilities_angles(
     supplied. Unlike repeatedly calling ``homodyne_probabilities``, the
     reduced state and the Fock wavefunctions for each x-chunk are computed
     only once.  Memory usage is bounded by ``cutoff * batch_size`` plus the
-    final output and the angle-dependent coefficients.  All inputs are
-    validated as for the single-angle API.
+    final output and the angle-dependent coefficients.  For sparse mixed
+    states with many angles, only occupied Fock superdiagonals are contracted
+    into Fourier coefficients. All inputs are validated as for the
+    single-angle API.
     """
     if np.iscomplexobj(thetas):
         raise ValueError("thetas must contain finite real numbers")
@@ -366,7 +426,11 @@ def homodyne_probabilities_angles(
     else:
         density = prepared.density
         assert density is not None
-        if isinstance(density, np.ndarray) and angles.size >= 8 and cutoff >= 8:
+        if isinstance(density, csr_array) and angles.size >= 8 and cutoff >= 8:
+            results = _sparse_angle_fourier(
+                density, angles, x, cutoff, hbar, batch_size, prepared.trace
+            )
+        elif isinstance(density, np.ndarray) and angles.size >= 8 and cutoff >= 8:
             # Dense mixed state: collect each upper diagonal of rho into an
             # angular Fourier coefficient C_d(x). The Hermitian lower half
             # contributes its complex conjugate, giving

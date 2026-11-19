@@ -221,60 +221,109 @@ def _apply_sparse_rows(
     )
 
 
-def _apply_sparse_diagonal(
-    state: Qobj, gate: LocalGate, selected: tuple[int, ...]
-) -> Qobj | None:
-    """Apply a diagonal CSR gate via Fock-index factors, without repacking.
+def _diagonal_factors(gate: LocalGate) -> np.ndarray | None:
+    """Return diagonal factors for NumPy/CSR Qobj gates, if strictly diagonal.
 
-    The fast path also supports nonunitary diagonal Kraus operators: kets
-    receive K, bras receive K.dag(), and operators receive K rho K.dag().
-    Only NumPy/SciPy CSR data is handled here; all other inputs fall back.
+    Do not interpret a generic exponential as diagonal: checking its generator
+    would not guarantee the exponential has the same stored representation.
     """
     if not isinstance(gate, Qobj):
         return None
-    state_data, gate_data = state._data, gate._data
-    if not isinstance(state_data, sparse.csr_array) or not isinstance(
-        gate_data, sparse.csr_array
-    ):
-        return None
-    gate_entries = gate_data.tocoo(copy=False)
-    if np.any(gate_entries.row != gate_entries.col):
-        return None
+    data = gate._data
+    if isinstance(data, sparse.csr_array):
+        entries = data.tocoo(copy=False)
+        if np.any((entries.row != entries.col) & (entries.data != 0)):
+            return None
+        return np.asarray(data.diagonal())
+    if isinstance(data, np.ndarray):
+        diagonal = np.diagonal(data)
+        if not np.array_equal(data, np.diag(diagonal)):
+            return None
+        return diagonal
+    return None
 
-    diagonal = gate_data.diagonal()
-    # CSR indices already encode columns.  Reuse indptr/indices directly
-    # instead of converting a potentially large ket or density to COO and
-    # reconstructing the CSR index structure afterwards.
+
+def _apply_dense_diagonal(
+    state: Qobj, gate: LocalGate, selected: tuple[int, ...], diagonal: np.ndarray
+) -> Qobj | None:
+    """Scale dense NumPy entries directly instead of packing/multiplying a gate.
+
+    This also handles nonunitary diagonal Kraus operators (and density
+    operators) and does not create a dense full-space diagonal operator.
+    """
+    data = state._data
+    if not isinstance(data, np.ndarray):
+        return None
+    if (
+        state.qtype != Qtype.oper
+        and isinstance(gate, Qobj)
+        and isinstance(gate._data, sparse.csr_array)
+    ):
+        # CSR diagonal gate @ dense ket/bra is already exceptionally cheap
+        # in SciPy. Avoid allocating and mapping every state index there.
+        return None
+    output = np.array(data, dtype=np.result_type(data.dtype, diagonal.dtype), copy=True)
     if state.qtype == Qtype.bra:
-        indices = _extract_flat_index(state_data.indices, state.dims[1], selected)
-        values = state_data.data * np.conjugate(diagonal[indices])
+        local_cols = _extract_flat_index(
+            np.arange(data.shape[1], dtype=np.intp), state.dims[1], selected
+        )
+        output *= np.conjugate(diagonal[local_cols])[None, :]
     else:
-        # Reconstruct row indices only for the *stored* entries. For very
-        # sparse states searchsorted avoids allocating arange(num_rows) and
-        # walking a huge indptr; otherwise repeat is faster.
-        if state_data.nnz < max(1, state_data.shape[0] // 100):
+        local_rows = _extract_flat_index(
+            np.arange(data.shape[0], dtype=np.intp), state.dims[0], selected
+        )
+        output *= diagonal[local_rows, None]
+        if state.qtype == Qtype.oper:
+            local_cols = _extract_flat_index(
+                np.arange(data.shape[1], dtype=np.intp), state.dims[1], selected
+            )
+            output *= np.conjugate(diagonal[local_cols])[None, :]
+    return Qobj._from_owned_data(
+        output,
+        dims=state.dims,
+        qtype=state.qtype,
+        tol=max(state._tol, gate._tol),
+    )
+
+
+def _apply_sparse_diagonal(
+    state: Qobj, gate: LocalGate, selected: tuple[int, ...], diagonal: np.ndarray
+) -> Qobj | None:
+    """Apply diagonal factors to stored CSR entries without rearranging axes.
+
+    Kets receive K, bras receive K.dag(), and operators receive K rho K.dag().
+    The gate may be backed by either CSR or a dense NumPy diagonal array.
+    """
+    data = state._data
+    if not isinstance(data, sparse.csr_array):
+        return None
+    if state.qtype == Qtype.bra:
+        indices = _extract_flat_index(data.indices, state.dims[1], selected)
+        values = data.data * np.conjugate(diagonal[indices])
+    else:
+        # Construct row indices only for stored entries, using searchsorted
+        # for very sparse states to avoid touching a huge array of empty rows.
+        if data.nnz < max(1, data.shape[0] // 100):
             rows = np.searchsorted(
-                state_data.indptr[1:],
-                np.arange(state_data.nnz, dtype=state_data.indptr.dtype),
+                data.indptr[1:],
+                np.arange(data.nnz, dtype=data.indptr.dtype),
                 side="right",
             )
         else:
             rows = np.repeat(
-                np.arange(state_data.shape[0], dtype=state_data.indptr.dtype),
-                np.diff(state_data.indptr),
+                np.arange(data.shape[0], dtype=data.indptr.dtype),
+                np.diff(data.indptr),
             )
         row_indices = _extract_flat_index(rows, state.dims[0], selected)
-        values = state_data.data * diagonal[row_indices]
+        values = data.data * diagonal[row_indices]
         if state.qtype == Qtype.oper:
-            col_indices = _extract_flat_index(
-                state_data.indices, state.dims[1], selected
-            )
+            col_indices = _extract_flat_index(data.indices, state.dims[1], selected)
             values *= np.conjugate(diagonal[col_indices])
 
     result = sparse.csr_array(
-        (values, state_data.indices, state_data.indptr), shape=state_data.shape
+        (values, data.indices.copy(), data.indptr.copy()), shape=data.shape
     )
-    return Qobj(
+    return Qobj._from_owned_data(
         result,
         dims=state.dims,
         qtype=state.qtype,
@@ -365,9 +414,24 @@ def apply_local(
             "convert the gate and state to the same backend"
         )
 
-    diagonal_result = _apply_sparse_diagonal(state, gate, selected)
-    if diagonal_result is not None:
-        return diagonal_result
+    # Small CSR diagonal @ dense vectors is already a fast sparse/dense
+    # product. Skip even the diagonal-inspection overhead on this route.
+    if (
+        isinstance(state_data, np.ndarray)
+        and state.qtype != Qtype.oper
+        and isinstance(gate, Qobj)
+        and isinstance(gate_data, sparse.csr_array)
+    ):
+        diagonal = None
+    else:
+        diagonal = _diagonal_factors(gate)
+    if diagonal is not None:
+        if isinstance(state_data, np.ndarray):
+            result = _apply_dense_diagonal(state, gate, selected, diagonal)
+        else:
+            result = _apply_sparse_diagonal(state, gate, selected, diagonal)
+        if result is not None:
+            return result
 
     if state.qtype == Qtype.bra:
         return _apply_rows(state.dag(), gate, selected).dag()

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import scipy as sp
-from numpy.typing import DTypeLike
+from numpy.typing import DTypeLike, NDArray
 
 from optiqs._compat import NotImplementedType
 from optiqs.utils import _to_numpy_dtype, get_device
@@ -940,17 +940,27 @@ class Qobj:
                     indices = entries.col
                     amplitudes = entries.data.conj()
 
-                multi = np.unravel_index(indices, subsystems)
+                row: NDArray[np.signedinteger[Any]]
+                col: NDArray[np.signedinteger[Any]]
 
-                row = np.ravel_multi_index(tuple(multi[i] for i in kept), kept_dims)
-
-                if traced:
-                    traced_dims = tuple(subsystems[i] for i in traced)
-                    col = np.ravel_multi_index(
-                        tuple(multi[i] for i in traced), traced_dims
-                    )
+                if len(kept) == 1:
+                    # For one retained mode, integer arithmetic avoids
+                    # materializing an unravel_index array for every mode.
+                    mode = kept[0]
+                    stride = math.prod(subsystems[mode + 1 :])
+                    block = subsystems[mode] * stride
+                    row = (indices // stride) % subsystems[mode]
+                    col = (indices // block) * stride + indices % stride
                 else:
-                    col = np.zeros_like(row)
+                    multi = np.unravel_index(indices, subsystems)
+                    row = np.ravel_multi_index(tuple(multi[i] for i in kept), kept_dims)
+                    if traced:
+                        traced_dims = tuple(subsystems[i] for i in traced)
+                        col = np.ravel_multi_index(
+                            tuple(multi[i] for i in traced), traced_dims
+                        )
+                    else:
+                        col = np.zeros_like(row)
 
                 sparse_matrix = sp.sparse.csr_array(
                     (amplitudes, (row, col)),
@@ -985,15 +995,31 @@ class Qobj:
 
         elif isinstance(data, sp.sparse.csr_array):
             entries = data.tocoo()
-            rows = np.unravel_index(entries.row, subsystems)
-            cols = np.unravel_index(entries.col, subsystems)
-
-            mask = np.ones(entries.nnz, dtype=bool)
-            for i in traced:
-                mask &= rows[i] == cols[i]
-
-            row = np.ravel_multi_index(tuple(rows[i][mask] for i in kept), kept_dims)
-            col = np.ravel_multi_index(tuple(cols[i][mask] for i in kept), kept_dims)
+            if len(kept) == 1:
+                # The traced-mode coordinates agree precisely when both
+                # the prefix and suffix around the retained mode agree.
+                # This replaces 2*len(subsystems) unravelled arrays with
+                # a handful of vectorized quotient/remainder operations.
+                mode = kept[0]
+                stride = math.prod(subsystems[mode + 1 :])
+                block = subsystems[mode] * stride
+                mask = (entries.row // block == entries.col // block) & (
+                    entries.row % stride == entries.col % stride
+                )
+                row = (entries.row[mask] // stride) % subsystems[mode]
+                col = (entries.col[mask] // stride) % subsystems[mode]
+            else:
+                rows = np.unravel_index(entries.row, subsystems)
+                cols = np.unravel_index(entries.col, subsystems)
+                mask = np.ones(entries.nnz, dtype=bool)
+                for i in traced:
+                    mask &= rows[i] == cols[i]
+                row = np.ravel_multi_index(
+                    tuple(rows[i][mask] for i in kept), kept_dims
+                )
+                col = np.ravel_multi_index(
+                    tuple(cols[i][mask] for i in kept), kept_dims
+                )
 
             result = sp.sparse.csr_array(
                 (entries.data[mask], (row, col)),

@@ -237,6 +237,39 @@ def _upper_pairs(
     )
 
 
+def _pack_wigner_diagonals(
+    diagonals: dict[int, NDArray[np.complex128]],
+) -> tuple[
+    NDArray[np.complex128],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Build compact, read-only-in-practice inputs for fused Numba Clenshaw."""
+    offsets = np.array(sorted(diagonals, reverse=True), dtype=np.int64)
+    lengths = np.array([diagonals[int(d)].size for d in offsets], dtype=np.int64)
+    starts = np.zeros(offsets.size, dtype=np.int64)
+    if starts.size > 1:
+        starts[1:] = np.cumsum(lengths[:-1])
+    coefficients = (
+        np.concatenate([diagonals[int(d)] for d in offsets])
+        if offsets.size
+        else np.empty(0, dtype=np.complex128)
+    )
+    inverse_denominators = np.empty(coefficients.size, dtype=np.float64)
+    back_factors = np.empty(coefficients.size, dtype=np.float64)
+    for index, offset in enumerate(offsets):
+        n = np.arange(lengths[index], dtype=np.float64)
+        denom = np.sqrt((n + 1) * (n + offset + 1))
+        start = starts[index]
+        end = start + lengths[index]
+        inverse_denominators[start:end] = 1.0 / denom
+        back_factors[start:end] = denom / np.sqrt((n + 2) * (n + offset + 2))
+    return coefficients, starts, lengths, offsets, inverse_denominators, back_factors
+
+
 def _wigner_laguerre(
     pairs: tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.complex128]],
     a: NDArray[np.complex128],
@@ -298,8 +331,8 @@ def wigner(
     pvec, hbar=...)`` as ``xvec`` to reuse the grid coordinates. In that case
     ``pvec`` must be omitted and ``hbar`` is taken from the grid.
 
-    ``accelerator='numba'`` optionally JIT-compiles the inner Clenshaw
-    recurrence when that method is used (requires ``pip install OptiQS[jit]``).
+    ``accelerator='numba'`` optionally JIT-compiles the entire Clenshaw
+    contraction when that method is used (requires ``pip install OptiQS[jit]``).
     The first call includes compilation overhead. The NumPy default avoids
     the optional dependency and retains startup performance.
     """
@@ -385,18 +418,20 @@ def wigner(
     else:
         pairs = _upper_pairs(coeff, rho)
 
-    # Import Numba only on explicit request and only for the Clenshaw path.
-    # With method='auto', sparse states can still select SciPy Laguerre.
-    evaluator = _clenshaw_laguerre
+    # JIT is opt-in. The fused kernel evaluates *all* diagonals and powers
+    # within a single per-point loop; no per-diagonal complex arrays are made.
+    numba_kernel = None
+    packed_diagonals = None
     if accelerator == "numba" and diagonals is not None:
         try:
-            from optiqs.phase_space._wigner_numba import clenshaw_laguerre
+            from optiqs.phase_space._wigner_numba import fused_wigner_clenshaw
         except ImportError as exc:
             raise ImportError(
                 "Numba is required for accelerator='numba'; "
                 "install with `pip install OptiQS[jit]`"
             ) from exc
-        evaluator = clenshaw_laguerre
+        numba_kernel = fused_wigner_clenshaw
+        packed_diagonals = _pack_wigner_diagonals(diagonals)
 
     output = np.zeros((p.size, x.size), dtype=np.float64)
     flat = output.reshape(-1)
@@ -416,9 +451,11 @@ def wigner(
             )
             z = a.real**2 + a.imag**2
         if diagonals is not None:
-            values = np.exp(-0.5 * z) * _wigner_clenshaw(
-                diagonals, a, z, evaluate=evaluator
-            )
+            if numba_kernel is not None:
+                assert packed_diagonals is not None
+                values = numba_kernel(*packed_diagonals, a, z)
+            else:
+                values = np.exp(-0.5 * z) * _wigner_clenshaw(diagonals, a, z)
         else:
             assert pairs is not None
             values = _wigner_laguerre(pairs, a, z)
