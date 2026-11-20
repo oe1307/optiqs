@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.sparse import csr_array
 
+from optiqs.core.low_rank_density import LowRankDensity
 from optiqs.core.q_obj import Qobj, Qtype
 
 if TYPE_CHECKING:
@@ -248,12 +249,14 @@ def _normalized_weights(
 
 
 def photon_number_probabilities(
-    state: Qobj, mode: int = 0, *, eta: float = 0.0
+    state: Qobj | LowRankDensity, mode: int = 0, *, eta: float = 0.0
 ) -> np.ndarray:
     """Return normalized probabilities of measuring 0, 1, ..., cutoff-1 photons.
 
     ``state`` may be a ket, bra, or density operator with NumPy, SciPy CSR, or
-    PyTorch storage.  For a tensor product, the leftmost mode has index 0.
+    PyTorch storage, or a NumPy/CSR ``LowRankDensity``. In the latter case
+    probabilities are obtained from the factors without forming a D x D
+    density matrix. For a tensor product, the leftmost mode has index 0.
     Unnormalized inputs are accepted; zero/invalid weights are rejected.
 
     For a ket the weights are sums of |amplitude|^2; for density operators they
@@ -276,11 +279,25 @@ def photon_number_probabilities(
     # Imported lazily because the joint-number module already imports the
     # no-loss weight routines above. Reuse its validated, cached binomial
     # kernel rather than maintaining an independent implementation.
-    from optiqs.measurements.joint_photon_number import _loss_kernel, _loss_probability
+    from optiqs.measurements.joint_photon_number import (
+        _loss_kernel,
+        _loss_probability,
+        _normalized_low_rank_joint_weights,
+    )
 
     eta = _loss_probability(eta)
-    dim, stride = _geometry(state, mode)
-    probabilities = _normalized_weights(state, dim, stride)[0]
+    if isinstance(state, LowRankDensity):
+        if isinstance(mode, (bool, np.bool_)) or not isinstance(mode, Integral):
+            raise TypeError("mode must be an integer subsystem index")
+        if not 0 <= mode < len(state.dims):
+            raise IndexError("mode is outside the available subsystems")
+        dim = state.dims[mode]
+        probabilities = _normalized_low_rank_joint_weights(
+            state, state.dims, (int(mode),)
+        ).reshape(-1)
+    else:
+        dim, stride = _geometry(state, mode)
+        probabilities = _normalized_weights(state, dim, stride)[0]
     if eta == 0.0:
         return probabilities
     if eta == 1.0:

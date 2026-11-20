@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, overload
 import numpy as np
 from scipy import sparse
 
+from optiqs.core.low_rank_density import LowRankDensity
 from optiqs.core.q_obj import Qobj, Qtype
 
 if TYPE_CHECKING:
@@ -27,6 +28,16 @@ def _scalar(data: object) -> complex:
     if isinstance(data, torch.Tensor):
         return complex(data.item())
     raise TypeError(f"Expected scalar data, received {type(data)}")
+
+
+@overload
+def _ket(
+    data: np.ndarray | sparse.csr_array, qtype: Qtype
+) -> np.ndarray | sparse.csr_array: ...
+
+
+@overload
+def _ket(data: torch.Tensor, qtype: Qtype) -> torch.Tensor: ...
 
 
 def _ket(
@@ -340,8 +351,117 @@ def _root_fidelity_torch(first: torch.Tensor, second: torch.Tensor) -> float:
     return float(torch.sqrt(spectrum).sum().item())
 
 
-def fidelity(first: Qobj, second: Qobj, *, squared: bool = True) -> float:
-    """Return the (squared) quantum-state fidelity between two ``Qobj`` states.
+def _small_factor_product(
+    left: np.ndarray | sparse.csr_array,
+    right: np.ndarray | sparse.csr_array,
+) -> np.ndarray:
+    """Compute X*Y in rank space, densifying at most the small result.
+
+    In particular, dense @ CSR is avoided because its behavior depends on
+    the NumPy/SciPy versions. Never materialize X @ X* or Y @ Y*.
+    """
+    if isinstance(left, np.ndarray) and isinstance(right, sparse.csr_array):
+        product = right.conj().T @ left
+        return np.asarray(product).conj().T
+    product = left.conj().T @ right
+    # SciPy's type stubs expose `sparray` for matrix products, but concrete
+    # CSR/CSC arrays provide `toarray()`. Narrow before calling that method.
+    if isinstance(product, (sparse.csr_array, sparse.csc_array)):
+        return product.toarray()
+    if isinstance(product, np.ndarray):
+        return product
+    raise TypeError("Unexpected NumPy/SciPy factor-product result")
+
+
+def _fidelity_with_low_rank(
+    first: Qobj | LowRankDensity,
+    second: Qobj | LowRankDensity,
+    *,
+    squared: bool,
+) -> float:
+    """Use the nonzero spectrum of X*Y, not a D-by-D matrix square root."""
+    if isinstance(first, LowRankDensity) and isinstance(second, LowRankDensity):
+        if first.dims != second.dims:
+            raise ValueError("fidelity() requires matching Hilbert-space dimensions")
+        a = first._numpy_factors()
+        b = second._numpy_factors()
+        norm_a = _positive_real(complex(first.trace), "first trace")
+        norm_b = _positive_real(complex(second.trace), "second trace")
+        root = float(np.linalg.svd(_small_factor_product(a, b), compute_uv=False).sum())
+    else:
+        low_rank = first if isinstance(first, LowRankDensity) else second
+        other = second if isinstance(first, LowRankDensity) else first
+        assert isinstance(low_rank, LowRankDensity) and isinstance(other, Qobj)
+        other_dims = (
+            other.dims[0]
+            if other.qtype == Qtype.ket
+            else other.dims[1]
+            if other.qtype == Qtype.bra
+            else other.dims[0]
+        )
+        if low_rank.dims != other_dims or (
+            other.qtype == Qtype.oper and other.dims[0] != other.dims[1]
+        ):
+            raise ValueError("fidelity() requires matching Hilbert-space dimensions")
+        data = other._data
+        if not isinstance(data, (np.ndarray, sparse.csr_array)):
+            raise TypeError("Cannot mix PyTorch and NumPy/SciPy states")
+        if not _finite(data):
+            raise ValueError("Quantum states must have finite entries")
+        factors = low_rank._numpy_factors()
+        low_rank_norm = _positive_real(complex(low_rank.trace), "low-rank trace")
+        if other.is_vector():
+            ket = _ket(data, other.qtype)
+            other_norm = _positive_real(_inner(ket, ket), "vector norm")
+            projected = _small_factor_product(factors, ket)
+            # A vector is a rank-one factor. Its only singular value is the
+            # Euclidean norm of X*ket, avoiding even a small SVD.
+            root = float(np.linalg.norm(projected))
+        else:
+            if not _hermitian(data):
+                raise ValueError("Density operator must be Hermitian")
+            other_norm = _positive_real(_scalar(data.diagonal().sum()), "density trace")
+            # X* rho X is only rank-by-rank even when rho is large.
+            if isinstance(data, np.ndarray) and isinstance(factors, sparse.csr_array):
+                dense_factors = factors.toarray()
+                reduced = dense_factors.conj().T @ (data @ dense_factors)
+            else:
+                applied = data @ factors
+                right: np.ndarray | sparse.csr_array
+                # Matrix multiplication is typed as a general SciPy sparse
+                # base class. Normalize its concrete storage to CSR before
+                # passing it to the rank-space helper.
+                if isinstance(applied, (np.ndarray, sparse.csr_array)):
+                    right = applied
+                elif isinstance(applied, sparse.csc_array):
+                    right = sparse.csr_array(applied)
+                else:
+                    raise TypeError("Unexpected density-factor product")
+                reduced = _small_factor_product(factors, right)
+            reduced = (reduced + reduced.conj().T) * 0.5
+            spectrum = _nonnegative_eigenvalues(
+                np.linalg.eigvalsh(reduced), "density-operator product"
+            )
+            root = float(np.sqrt(spectrum).sum())
+        norm_a, norm_b = low_rank_norm, other_norm
+
+    # Divide the root fidelity by each norm's square root separately so a
+    # product of two large but finite traces cannot overflow float64.
+    root = (root / math.sqrt(norm_a)) / math.sqrt(norm_b)
+    result = root * root
+    if not math.isfinite(result) or result < -1e-6 or result > 1 + 1e-6:
+        raise ValueError("States must be positive semidefinite")
+    result = max(0.0, min(1.0, result))
+    return result if squared else math.sqrt(result)
+
+
+def fidelity(
+    first: Qobj | LowRankDensity,
+    second: Qobj | LowRankDensity,
+    *,
+    squared: bool = True,
+) -> float:
+    """Return the (squared) quantum-state fidelity between two states.
 
     The convention is ``F(rho, sigma) = (Tr sqrt(sqrt(rho) sigma sqrt(rho)))**2``.
     With ``squared=False``, return its square root (the convention used by
@@ -350,9 +470,9 @@ def fidelity(first: Qobj, second: Qobj, *, squared: bool = True) -> float:
 
     Parameters
     ----------
-    first, second : Qobj
-        Kets, bras, or positive-semidefinite density operators acting on the
-        same Hilbert space (including the same subsystem dimensions).
+    first, second : Qobj or LowRankDensity
+        Kets, bras, positive-semidefinite density operators or low-rank
+        factors acting on the same Hilbert space (including subsystem dims).
     squared : bool, default True
         If False, return the unsquared Uhlmann fidelity.
 
@@ -372,11 +492,19 @@ def fidelity(first: Qobj, second: Qobj, *, squared: bool = True) -> float:
     instead. NumPy/SciPy Qobj can be
     freely mixed; PyTorch Qobj must both be on the same device. The fast paths
     assume density operators are positive semidefinite; Hermiticity is checked.
+    For two ``LowRankDensity`` objects ``rho=X X*`` and ``sigma=Y Y*``,
+    compute ``||X*Y||_*`` using a rank-by-rank SVD, without materializing
+    either density matrix. A low-rank state can also be compared to a
+    NumPy/CSR ``Qobj``; a mixed ``Qobj`` uses the small matrix ``X* rho X``.
     """
-    if not isinstance(first, Qobj) or not isinstance(second, Qobj):
-        raise TypeError("fidelity() arguments must be Qobj instances")
     if not isinstance(squared, bool):
         raise TypeError("squared must be a bool")
+    if not isinstance(first, (Qobj, LowRankDensity)) or not isinstance(
+        second, (Qobj, LowRankDensity)
+    ):
+        raise TypeError("fidelity() arguments must be Qobj or LowRankDensity")
+    if isinstance(first, LowRankDensity) or isinstance(second, LowRankDensity):
+        return _fidelity_with_low_rank(first, second, squared=squared)
 
     def space(state: Qobj) -> tuple[int, ...]:
         if state.qtype == Qtype.ket:

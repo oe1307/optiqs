@@ -668,6 +668,8 @@ def apply_local_sequence(
     operations: Iterable[tuple[LocalGate, int | Sequence[int]]],
     *,
     cache_sparse_plans: bool = True,
+    fuse_same_modes: bool = False,
+    max_fused_gate_dim: int = 64,
 ) -> Qobj:
     """Apply local operations in order, fusing consecutive diagonal phases.
 
@@ -684,6 +686,16 @@ def apply_local_sequence(
     this option if you intentionally mutate private ``gate._data`` during
     iteration over ``operations``.
 
+    With ``fuse_same_modes=True``, consecutive NumPy/CSR ``Qobj`` operators
+    on the *same ordered modes* are first multiplied in the small local
+    Hilbert space and applied once. This works for arbitrary non-diagonal
+    gates, including nonunitary operators and both kets and density matrices.
+    Fusion is opt-in because multiplying the operators has a setup cost,
+    can destroy sparsity, and can alter roundoff. ``max_fused_gate_dim``
+    bounds the dimension of the intermediate gate (default 64). Operators
+    with larger local dimensions and lazy operators are applied normally.
+    Do not mutate gates while consuming the operation sequence.
+
     Examples
     --------
     >>> result = apply_local_sequence(psi, [
@@ -693,7 +705,17 @@ def apply_local_sequence(
     """
     if not isinstance(cache_sparse_plans, bool):
         raise TypeError("cache_sparse_plans must be a bool")
+    if not isinstance(fuse_same_modes, bool):
+        raise TypeError("fuse_same_modes must be a bool")
+    if (
+        isinstance(max_fused_gate_dim, (bool, np.bool_))
+        or not isinstance(max_fused_gate_dim, Integral)
+        or max_fused_gate_dim < 1
+    ):
+        raise ValueError("max_fused_gate_dim must be a positive integer")
     pending: list[tuple[Qobj, tuple[int, ...], np.ndarray]] = []
+    local_pending: list[Qobj] = []
+    local_modes: tuple[int, ...] = ()
     plans: dict[
         tuple[int, tuple[int, ...], tuple[int, ...]],
         tuple[Qobj, SparseKetLocalPlan],
@@ -741,12 +763,25 @@ def apply_local_sequence(
         pending.clear()
         return result
 
+    def flush_local(current: Qobj) -> Qobj:
+        nonlocal local_modes
+        if not local_pending:
+            return current
+        merged = local_pending[0]
+        for next_gate in local_pending[1:]:
+            # (U2 @ U1) acts in the same order as first U1, then U2.
+            merged = next_gate @ merged
+        result = apply(current, merged, local_modes)
+        local_pending.clear()
+        local_modes = ()
+        return result
+
     current = state
     for gate, modes in operations:
         # Preserve apply_local's type, dimensions and mode validation on
         # operations that cannot safely join the pending fusion group.
         if not isinstance(gate, Qobj):
-            current = flush(current)
+            current = flush_local(flush(current))
             current = apply(current, gate, modes)
             continue
         dims = current.dims[1] if current.qtype == Qtype.bra else current.dims[0]
@@ -754,14 +789,29 @@ def apply_local_sequence(
         required = tuple(dims[i] for i in selected)
         diagonal = _diagonal_factors(gate)
         if (
-            gate.qtype != Qtype.oper
-            or gate.dims != (required, required)
-            or diagonal is None
-            or not np.all(np.isfinite(diagonal))
-            or not np.all(np.abs(np.abs(diagonal) - 1.0) <= 1e-14)
+            gate.qtype == Qtype.oper
+            and gate.dims == (required, required)
+            and diagonal is not None
+            and np.all(np.isfinite(diagonal))
+            and np.all(np.abs(np.abs(diagonal) - 1.0) <= 1e-14)
+        ):
+            current = flush_local(current)
+            pending.append((gate, selected, diagonal))
+            continue
+        if (
+            fuse_same_modes
+            and gate.qtype == Qtype.oper
+            and gate.dims == (required, required)
+            and math.prod(required) <= max_fused_gate_dim
+            and isinstance(current._data, (np.ndarray, sparse.csr_array))
+            and isinstance(gate._data, (np.ndarray, sparse.csr_array))
         ):
             current = flush(current)
-            current = apply(current, gate, selected)
+            if local_pending and selected != local_modes:
+                current = flush_local(current)
+            local_modes = selected
+            local_pending.append(gate)
             continue
-        pending.append((gate, selected, diagonal))
-    return flush(current)
+        current = flush_local(flush(current))
+        current = apply(current, gate, selected)
+    return flush_local(flush(current))

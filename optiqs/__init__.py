@@ -1,4 +1,4 @@
-from optiqs.channels import photon_loss
+from optiqs.channels import photon_loss, photon_loss_sequence
 from optiqs.core import (
     Expm,
     LazyCachedOperator,
@@ -108,6 +108,7 @@ __all__ = [
     "phase_shift",
     "photon_loss",
     "photon_loss_low_rank",
+    "photon_loss_sequence",
     "photon_number_probabilities",
     "pnrd",
     "post_select",

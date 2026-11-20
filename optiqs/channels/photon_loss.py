@@ -8,6 +8,7 @@ or a Liouville-space superoperator. Sparse inputs are never densified.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from functools import lru_cache
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, cast
@@ -17,10 +18,46 @@ import numpy.typing as npt
 from scipy.sparse import csr_array
 from scipy.special import gammaln
 
+from optiqs.core.low_rank_density import LowRankDensity
 from optiqs.core.q_obj import Qobj, Qtype
 
 if TYPE_CHECKING:
     import torch
+
+
+class _BalancedCsrSum:
+    """Accumulate bounded sparse blocks in a binary reduction tree.
+
+    Repeated ``output += partial`` scans an ever-growing CSR matrix on each
+    batch. A binary carry scheme merges each block at most O(log batches)
+    times and holds at most one partial at each level. Duplicate COO indices
+    are still summed by the CSR constructor before insertion.
+    """
+
+    def __init__(self, shape: tuple[int, int], dtype: np.dtype | type) -> None:
+        self._shape = shape
+        self._dtype = dtype
+        self._levels: list[csr_array | None] = []
+
+    def add(self, part: csr_array) -> None:
+        level = 0
+        while level < len(self._levels) and self._levels[level] is not None:
+            other = self._levels[level]
+            assert other is not None
+            part = other + part
+            self._levels[level] = None
+            level += 1
+        if level == len(self._levels):
+            self._levels.append(part)
+        else:
+            self._levels[level] = part
+
+    def finish(self) -> csr_array:
+        result = csr_array(self._shape, dtype=self._dtype)
+        for part in reversed(self._levels):
+            if part is not None:
+                result = result + part
+        return result
 
 
 def _jump_amplitudes(
@@ -150,9 +187,9 @@ def _apply_sparse_by_lost(
     rows, cols, values = matrix.row, matrix.col, matrix.data
     size = data.shape[0]
     output_dtype = data.dtype if data.dtype.kind in "fc" else np.float64
-    output = csr_array((size, size), dtype=output_dtype)
+    accumulator = _BalancedCsrSum((size, size), output_dtype)
     if matrix.nnz == 0:
-        return output
+        return accumulator.finish()
 
     row_photons = (rows // stride) % dim
     col_photons = (cols // stride) % dim
@@ -164,7 +201,7 @@ def _apply_sparse_by_lost(
     batch_entries = 0
 
     def flush_batch() -> None:
-        nonlocal output, batch_entries
+        nonlocal batch_entries
         if not batch_rows:
             return
         partial = csr_array(
@@ -174,7 +211,7 @@ def _apply_sparse_by_lost(
             ),
             shape=(size, size),
         )
-        output = output + partial
+        accumulator.add(partial)
         batch_rows.clear()
         batch_cols.clear()
         batch_values.clear()
@@ -211,7 +248,7 @@ def _apply_sparse_by_lost(
         ):
             flush_batch()
     flush_batch()
-    return output
+    return accumulator.finish()
 
 
 def _apply_sparse(
@@ -248,9 +285,9 @@ def _apply_sparse(
     coo = data.tocoo(copy=False)
     rows, cols, values = coo.row, coo.col, coo.data
     dtype = data.dtype if data.dtype.kind in "fc" else np.float64
-    output = csr_array(data.shape, dtype=dtype)
+    accumulator = _BalancedCsrSum(data.shape, dtype)
     if coo.nnz == 0:
-        return output
+        return accumulator.finish()
 
     row_photons = (rows // stride) % dim
     col_photons = (cols // stride) % dim
@@ -338,9 +375,9 @@ def _apply_sparse(
                 (out_values, (out_rows, out_cols)),
                 shape=data.shape,
             )
-            output = output + partial
+            accumulator.add(partial)
         start = stop
-    return output
+    return accumulator.finish()
 
 
 def _sparse_diagonal_support(
@@ -814,3 +851,60 @@ def photon_loss(
     return Qobj._from_owned_data(
         result, dims=(dims, dims), qtype=Qtype.oper, tol=state._tol
     )
+
+
+def photon_loss_sequence(
+    state: Qobj | LowRankDensity,
+    losses: Iterable[tuple[float, int]],
+    *,
+    accelerator: str = "numpy",
+) -> Qobj | LowRankDensity:
+    """Apply pure-loss channels, combining all transmissivities by mode.
+
+    ``losses`` contains ``(eta, mode)`` pairs where eta is the photon
+    *survival* probability. Since pure-loss channels commute on different
+    modes and satisfy ``L(a) L(b) = L(a*b)`` on the same mode, each mode is
+    processed only once. This is exact for a sequence containing *only*
+    loss channels; do not fuse across intervening noncommuting gates.
+
+    ``Qobj`` inputs return a ``Qobj`` density matrix, and ``LowRankDensity``
+    inputs retain the low-rank representation. An empty sequence returns a
+    copy of the original state. The accelerator affects Qobj CSR inputs only.
+    """
+    if not isinstance(state, (Qobj, LowRankDensity)):
+        raise TypeError("state must be a Qobj or LowRankDensity")
+    if accelerator not in ("numpy", "numba"):
+        raise ValueError("accelerator must be 'numpy' or 'numba'")
+    dims = (
+        state.dims
+        if isinstance(state, LowRankDensity)
+        else state.dims[1]
+        if state.qtype == Qtype.bra
+        else state.dims[0]
+    )
+    combined: dict[int, float] = {}
+    for eta, mode in losses:
+        if isinstance(eta, (bool, np.bool_)) or not isinstance(eta, Real):
+            raise TypeError("eta must be a real transmissivity")
+        if not math.isfinite(eta) or not 0 <= eta <= 1:
+            raise ValueError("eta must be finite and in [0, 1]")
+        if isinstance(mode, (bool, np.bool_)) or not isinstance(mode, Integral):
+            raise TypeError("mode must be an integer subsystem index")
+        if not 0 <= mode < len(dims):
+            raise IndexError("mode is outside the available subsystems")
+        index = int(mode)
+        combined[index] = combined.get(index, 1.0) * float(eta)
+
+    if not combined:
+        if isinstance(state, LowRankDensity):
+            return LowRankDensity(state.factors, state.dims)
+        return state.copy()
+
+    current: Qobj | LowRankDensity = state
+    for mode, eta in combined.items():
+        current = (
+            current.photon_loss(eta, mode)
+            if isinstance(current, LowRankDensity)
+            else photon_loss(current, eta, mode, accelerator=accelerator)
+        )
+    return current

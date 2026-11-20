@@ -23,6 +23,7 @@ import numpy as np
 from scipy.sparse import csr_array
 from scipy.special import gammaln
 
+from optiqs.core.low_rank_density import LowRankDensity
 from optiqs.core.q_obj import Qobj, Qtype
 from optiqs.measurements.photon_number import (
     _checked_diagonal_numpy,
@@ -46,12 +47,15 @@ __all__ = [
 
 
 def _modes_and_dims(
-    state: Qobj, modes: Sequence[int] | None
+    state: Qobj | LowRankDensity, modes: Sequence[int] | None
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Validate selected modes and retain their specified order."""
-    # Also validates Qobj type and density-operator subsystem geometry.
-    _geometry(state, 0)
-    dims = state.dims[1] if state.qtype == Qtype.bra else state.dims[0]
+    if isinstance(state, LowRankDensity):
+        dims = state.dims
+    else:
+        # Also validates Qobj type and density-operator subsystem geometry.
+        _geometry(state, 0)
+        dims = state.dims[1] if state.qtype == Qtype.bra else state.dims[0]
     if modes is None:
         selected = tuple(range(len(dims)))
     else:
@@ -597,14 +601,80 @@ def _normalized_joint_weights(
     return raw / total, raw, scale
 
 
+def _low_rank_joint_weights(
+    state: LowRankDensity,
+    dims: tuple[int, ...],
+    modes: tuple[int, ...],
+    *,
+    scaled: bool = False,
+) -> np.ndarray:
+    """Born weights from factor rows: O(D * rank), never O(D**2).
+
+    For CSR factors, bin only stored factor entries, without creating a
+    D-length probability vector. ``scaled`` is the overflow/underflow-safe
+    fallback: divide amplitudes before squaring, then normalize the result.
+    """
+    factors = state._numpy_factors()
+    values = factors.data if isinstance(factors, csr_array) else factors
+    if scaled:
+        scale = max(
+            float(np.max(np.abs(np.real(values)), initial=0.0)),
+            float(np.max(np.abs(np.imag(values)), initial=0.0))
+            if np.iscomplexobj(values)
+            else 0.0,
+        )
+        if scale <= 0 or not isfinite(scale):
+            raise ValueError("state must have positive finite norm or trace")
+        values = values / scale
+    weights = _squared_magnitudes_numpy(values)
+    if isinstance(factors, csr_array):
+        if factors.nnz <= max(1, factors.shape[0] // 100):
+            rows = np.searchsorted(
+                factors.indptr[1:],
+                np.arange(factors.nnz, dtype=factors.indptr.dtype),
+                side="right",
+            )
+        else:
+            rows = np.repeat(
+                np.arange(factors.shape[0], dtype=factors.indptr.dtype),
+                np.diff(factors.indptr),
+            )
+        bins = _flat_outcomes(rows, dims, modes)
+        shape = tuple(dims[mode] for mode in modes)
+        return np.bincount(bins, weights=weights, minlength=prod(shape)).reshape(shape)
+    return _reduce_numpy(weights.sum(axis=1, dtype=np.float64), dims, modes)
+
+
+def _normalized_low_rank_joint_weights(
+    state: LowRankDensity, dims: tuple[int, ...], modes: tuple[int, ...]
+) -> np.ndarray:
+    """Normalize a factor-based marginal without materializing a density."""
+    with np.errstate(over="ignore", under="ignore"):
+        weights = _low_rank_joint_weights(state, dims, modes)
+    try:
+        total = _checked_total(weights)
+        if total < 1e-300:
+            raise ValueError("subnormal weights require rescaling")
+    except ValueError:
+        with np.errstate(over="ignore", under="ignore"):
+            weights = _low_rank_joint_weights(state, dims, modes, scaled=True)
+        total = _checked_total(weights)
+    return weights / total
+
+
 def joint_photon_number_probabilities(
-    state: Qobj, modes: Sequence[int] | None = None, *, eta: float = 0.0
+    state: Qobj | LowRankDensity,
+    modes: Sequence[int] | None = None,
+    *,
+    eta: float = 0.0,
 ) -> np.ndarray:
     """Exact Born distribution of *two or more* photon-count modes.
 
     ``modes=None`` measures all modes. Otherwise output axes follow precisely
     the order in ``modes`` (even if unsorted); unselected modes are marginalized.
     Kets, bras and density operators work with NumPy, SciPy CSR and PyTorch.
+    ``LowRankDensity`` works with NumPy/CSR factor storage directly; no
+    dense density matrix is allocated.
     Unnormalized states are accepted, invalid diagonals/zero norms rejected.
     ``eta`` is the independent photon *loss probability* of each measured
     mode: 0 is ideal detection, 1 means no photons survive. It has the same
@@ -619,7 +689,11 @@ def joint_photon_number_probabilities(
     """
     dims, selected = _modes_and_dims(state, modes)
     eta = _loss_probability(eta)
-    normalized, _, _ = _normalized_joint_weights(state, dims, selected)
+    normalized = (
+        _normalized_low_rank_joint_weights(state, dims, selected)
+        if isinstance(state, LowRankDensity)
+        else _normalized_joint_weights(state, dims, selected)[0]
+    )
     if eta == 0.0:
         return normalized
     if eta == 1.0:
