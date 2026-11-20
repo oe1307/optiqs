@@ -8,6 +8,7 @@ or a Liouville-space superoperator. Sparse inputs are never densified.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, cast
 
@@ -105,6 +106,20 @@ def _apply_dense_numpy(
 # *generated* transitions, rather than on the number of original CSR entries.
 _SPARSE_LOSS_BATCH_MAX_ENTRIES = 250_000
 _SPARSE_LOSS_BATCH_TERMS = 32
+# Cache at most eight 1-MiB Numba amplitude tables. Larger or very sparse
+# problems keep the original log-weight kernel to avoid the setup cost.
+_NUMBA_TABLE_MAX_BYTES = 1 << 20
+
+
+@lru_cache(maxsize=8)
+def _cached_numba_loss_amplitudes(levels: int, eta: float) -> np.ndarray:
+    """Read-only Kraus amplitudes indexed by [lost, input photons]."""
+    log_factorials = gammaln(np.arange(levels, dtype=np.float64) + 1)
+    result = np.zeros((levels, levels), dtype=np.float64)
+    for lost in range(levels):
+        result[lost, lost:] = _jump_amplitudes(levels, lost, eta, log_factorials)
+    result.flags.writeable = False
+    return result
 
 
 def _apply_zero_sparse(data: csr_array, dim: int, stride: int) -> csr_array:
@@ -216,14 +231,19 @@ def _apply_sparse(
         return _apply_sparse_by_lost(data, dim, stride, eta)
 
     sparse_loss_kernel = None
+    table_kernel = None
     if accelerator == "numba":
         try:
-            from optiqs.channels._photon_loss_numba import sparse_loss_transitions
+            from optiqs.channels._photon_loss_numba import (
+                sparse_loss_transitions,
+                sparse_loss_transitions_table,
+            )
         except ImportError as exc:
             raise ImportError(
                 "The Numba photon-loss accelerator requires 'pip install OptiQS[jit]'"
             ) from exc
         sparse_loss_kernel = sparse_loss_transitions
+        table_kernel = sparse_loss_transitions_table
 
     coo = data.tocoo(copy=False)
     rows, cols, values = coo.row, coo.col, coo.data
@@ -238,6 +258,18 @@ def _apply_sparse(
     cumulative = np.cumsum(counts, dtype=np.int64)
     log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
     log_eta, log_loss = math.log(eta), math.log1p(-eta)
+    # A small table replaces per-transition exp/gammaln arithmetic in the
+    # JIT kernel. Build it only when the generated transition count is large
+    # enough to amortize setup and the table fits the bounded cache.
+    amplitudes = None
+    if table_kernel is not None:
+        levels = int(max(row_photons.max(), col_photons.max())) + 1
+        if levels * levels * np.dtype(
+            np.float64
+        ).itemsize <= _NUMBA_TABLE_MAX_BYTES and int(cumulative[-1]) >= max(
+            128, 4 * levels * levels
+        ):
+            amplitudes = _cached_numba_loss_amplitudes(levels, eta)
 
     start = 0
     while start < coo.nnz:
@@ -254,7 +286,18 @@ def _apply_sparse(
                 )
             ),
         )
-        if sparse_loss_kernel is not None:
+        if amplitudes is not None and table_kernel is not None:
+            out_rows, out_cols, out_values = table_kernel(
+                rows[start:stop],
+                cols[start:stop],
+                values[start:stop].astype(dtype, copy=False),
+                row_photons[start:stop],
+                col_photons[start:stop],
+                counts[start:stop],
+                amplitudes,
+                stride,
+            )
+        elif sparse_loss_kernel is not None:
             out_rows, out_cols, out_values = sparse_loss_kernel(
                 rows[start:stop],
                 cols[start:stop],

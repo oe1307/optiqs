@@ -194,9 +194,10 @@ class LowRankDensity:
         """Apply one pure-loss channel to factors (rank may grow by ``dim``).
 
         The final factor columns are the Kraus images of the incoming factor
-        columns. CSR factors remain sparse; transitions are built in bounded
-        batches. Zero Kraus columns are discarded, but general linear
-        dependencies are not (call ``compress`` for approximate truncation).
+        columns. Dense factors use direct tensor slices (no COO/CSR roundtrip),
+        while CSR factors remain sparse with bounded transition batches.
+        Zero Kraus columns are discarded, but general linear dependencies are
+        not (call ``compress`` for approximate truncation).
         """
         if isinstance(eta, (bool, np.bool_)) or not isinstance(eta, Real):
             raise TypeError("eta must be a real transmissivity")
@@ -213,6 +214,38 @@ class LowRankDensity:
         stride = math.prod(self.dims[mode + 1 :])
         factors = self._numpy_factors()
         rows_dim, rank = factors.shape
+        if isinstance(factors, np.ndarray):
+            # Kraus columns are indexed as (input column, lost photons).
+            # Working directly on the dense tensor avoids creating O(D*rank)
+            # COO coordinates and repeatedly constructing/adding CSR arrays.
+            left = rows_dim // (dim * stride)
+            source = factors.reshape(left, dim, stride, rank)
+            occupied = np.flatnonzero(np.any(source, axis=(0, 2, 3)))
+            if not occupied.size:
+                raise ValueError("factors must have positive trace")
+            losses = int(occupied[-1]) + 1
+            result = np.zeros((left, dim, stride, rank, losses), dtype=factors.dtype)
+            if eta == 0:
+                # Every input Fock number loses exactly that many photons.
+                for lost in range(losses):
+                    result[:, 0, :, :, lost] = source[:, lost, :, :]
+            else:
+                from optiqs.channels.photon_loss import _jump_amplitudes
+
+                log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
+                for lost in range(losses):
+                    weights = _jump_amplitudes(dim, lost, float(eta), log_factorials)
+                    result[:, : dim - lost, :, :, lost] = (
+                        source[:, lost:, :, :] * weights[None, :, None, None]
+                    )
+            dense = result.reshape(rows_dim, rank * losses)
+            active_columns = np.flatnonzero(np.any(dense, axis=0))
+            if not active_columns.size:
+                raise ValueError("loss produced a zero-trace state")
+            return LowRankDensity(
+                dense[:, active_columns], self.dims, tol=self._factor._tol
+            )
+
         log_factorials = gammaln(np.arange(dim, dtype=np.float64) + 1)
         # Build only up to the highest occupied Fock number. If the factor
         # is sparse and high Fock levels are absent, this saves columns.
@@ -283,15 +316,17 @@ class LowRankDensity:
         if not active_columns.size:
             raise ValueError("loss produced a zero-trace state")
         output = sparse.csr_array(output[:, active_columns])
-        if isinstance(factors, np.ndarray):
-            return LowRankDensity(output.toarray(), self.dims, tol=self._factor._tol)
         return LowRankDensity(output, self.dims, tol=self._factor._tol)
 
     def compress(self, max_rank: int, *, relative_tol: float = 0.0) -> LowRankDensity:
-        """Optionally reduce rank via SVD; discarded singular values lose trace.
+        """Reduce rank; discarded singular values lose trace.
 
-        This is an approximate operation and may densify CSR factors. Use
-        ``relative_tol=0`` to keep the largest ``max_rank`` singular values.
+        For tall, well-conditioned factors, diagonalize the much smaller
+        ``X.conj().T @ X`` instead of computing a full SVD of ``X``.
+        Fall back to SVD if the Gram spectrum is poorly conditioned (squaring
+        the condition number can otherwise lose small singular values).
+        This operation may densify CSR factors. Use ``relative_tol=0`` to
+        keep the largest ``max_rank`` singular values.
         """
         if (
             isinstance(max_rank, bool)
@@ -303,6 +338,31 @@ class LowRankDensity:
             raise ValueError("relative_tol must be finite and nonnegative")
         factors = self._numpy_factors()
         matrix = factors.toarray() if isinstance(factors, sparse.csr_array) else factors
+        if matrix.shape[1] * 2 <= matrix.shape[0]:
+            gram = matrix.conj().T @ matrix
+            eigenvalues, eigenvectors = np.linalg.eigh(gram)
+            # eigh returns ascending eigenvalues; the descending order gives
+            # the same rank/relative tolerance choices as a thin SVD.
+            spectrum = eigenvalues[::-1]
+            eps = np.finfo(matrix.dtype).eps
+            if spectrum[0] > 0 and spectrum[-1] > 64 * eps * spectrum[0]:
+                singular_values = np.sqrt(spectrum)
+                threshold = singular_values[0] * relative_tol
+                # Near the truncation boundary, use the better-conditioned
+                # SVD to avoid a different kept rank due to roundoff.
+                if not (
+                    relative_tol > 0
+                    and np.any(
+                        np.isclose(singular_values, threshold, rtol=1e-6, atol=0)
+                    )
+                ):
+                    keep = min(
+                        int(max_rank),
+                        max(1, int(np.count_nonzero(singular_values > threshold))),
+                    )
+                    reduced = matrix @ eigenvectors[:, ::-1][:, :keep]
+                    return LowRankDensity(reduced, self.dims, tol=self._factor._tol)
+
         u, s, _ = np.linalg.svd(matrix, full_matrices=False)
         keep = min(
             int(max_rank), max(1, int(np.count_nonzero(s > s[0] * relative_tol)))

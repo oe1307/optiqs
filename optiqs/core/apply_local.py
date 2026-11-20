@@ -219,6 +219,10 @@ class SparseKetLocalPlan:
         ):
             local_offsets += digit * self._strides[axis]
         self._local_offsets = local_offsets
+        # These arrays depend only on the gate, not the incoming sparse ket.
+        # Reusing the plan avoids repeating these gathers/differences.
+        self._column_counts = np.diff(self._gate.indptr)
+        self._scatter_offsets = local_offsets[self._gate.indices]
 
     def __call__(self, state: Qobj) -> Qobj:
         """Apply the compiled gate; retain the sparse ket representation."""
@@ -248,7 +252,7 @@ class SparseKetLocalPlan:
         local = _extract_flat_index(rows, self.dims, self.modes)
         remainder = rows - self._local_offsets[local]
         indptr = self._gate.indptr
-        counts = indptr[local + 1] - indptr[local]
+        counts = self._column_counts[local]
         parents = np.repeat(np.arange(rows.size, dtype=np.intp), counts)
         # All positions in the relevant CSC columns, without a Python loop
         # over occupied Fock states or a full-space tensor permutation.
@@ -256,9 +260,7 @@ class SparseKetLocalPlan:
         positions = np.repeat(indptr[local] - offsets, counts) + np.arange(
             parents.size, dtype=np.intp
         )
-        output_rows = (
-            remainder[parents] + self._local_offsets[self._gate.indices[positions]]
-        )
+        output_rows = remainder[parents] + self._scatter_offsets[positions]
         values = source.data[parents] * self._gate.data[positions]
         result = sparse.csr_array(
             cast(Any, (values, (output_rows, np.zeros_like(output_rows)))),

@@ -57,3 +57,36 @@ def sparse_loss_transitions(
                 out_values[position] = contribution
                 position += 1
     return out_rows[:position], out_cols[:position], out_values[:position]
+
+
+@njit(cache=True)
+def sparse_loss_transitions_table(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    values: np.ndarray,
+    row_photons: np.ndarray,
+    col_photons: np.ndarray,
+    counts: np.ndarray,
+    amplitudes: np.ndarray,
+    stride: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Use precomputed <n-lost|K_lost|n> when many transitions reuse them."""
+    size = 0
+    for index in range(counts.size):
+        size += counts[index]
+    out_rows = np.empty(size, dtype=np.int64)
+    out_cols = np.empty(size, dtype=np.int64)
+    out_values = np.empty(size, dtype=values.dtype)
+    position = 0
+    for index in range(rows.size):
+        nr = row_photons[index]
+        nc = col_photons[index]
+        for lost in range(counts[index]):
+            contribution = values[index] * amplitudes[lost, nr] * amplitudes[lost, nc]
+            if contribution != 0:
+                shift = lost * stride
+                out_rows[position] = rows[index] - shift
+                out_cols[position] = cols[index] - shift
+                out_values[position] = contribution
+                position += 1
+    return out_rows[:position], out_cols[:position], out_values[:position]
