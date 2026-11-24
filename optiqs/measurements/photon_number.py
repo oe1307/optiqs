@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 # operator.  We validate its *individual* diagonal entries before grouping:
 # summing first could hide a negative or imaginary diagonal contribution.
 _DIAGONAL_ULPS = 64
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 
 def _geometry(state: Qobj, mode: int) -> tuple[int, int]:
@@ -45,14 +47,37 @@ def _geometry(state: Qobj, mode: int) -> tuple[int, int]:
 
 
 def _squared_magnitudes_numpy(values: np.ndarray) -> np.ndarray:
-    """Squared amplitudes in float64, avoiding integer/f32 overflow in squaring."""
+    """Squared amplitudes in float64 without low-precision intermediates."""
     if values.dtype.kind == "c":
-        # |z| uses a stable hypot implementation.  Convert *before* squaring
-        # so a complex64 amplitude around 1e20 does not overflow float32.
+        if values.dtype.itemsize < 16:
+            # abs(complex64) can itself overflow or round subnormal values.
+            # Square the components in float64 before adding; no complex128
+            # copy of the state is needed.
+            weights = np.square(values.real, dtype=np.float64)
+            weights += np.square(values.imag, dtype=np.float64)
+            return weights
         magnitude = np.abs(values).astype(np.float64, copy=False)
         return np.square(magnitude, dtype=np.float64)
     # Convert signed integers before abs/squaring (including int64 minimum).
     return np.square(values, dtype=np.float64)
+
+
+def _needs_complex64_normalization_promotion(
+    dtype: np.dtype, normalization: float
+) -> bool:
+    """Check whether a complex64 normalization scalar needs double precision."""
+    return (
+        dtype.kind == "c"
+        and dtype.itemsize < 16
+        and not _FLOAT32_TINY <= normalization <= _FLOAT32_MAX
+    )
+
+
+def _normalize_numpy_vector(values: np.ndarray, normalization: float) -> np.ndarray:
+    """Normalize selected amplitudes without narrowing an extreme divisor."""
+    if _needs_complex64_normalization_promotion(values.dtype, normalization):
+        return (values.astype(np.complex128) / normalization).astype(values.dtype)
+    return values / normalization
 
 
 def _checked_diagonal_numpy(diagonal: npt.NDArray[np.generic]) -> np.ndarray:
@@ -327,7 +352,14 @@ def _project(
 
     if dim == 1:
         # The only projector is identity; no indexing/scattering is needed.
-        result = data / normalization
+        if (
+            state.is_vector()
+            and isinstance(data, (np.ndarray, csr_array))
+            and _needs_complex64_normalization_promotion(data.dtype, normalization)
+        ):
+            result = (data.astype(np.complex128) / normalization).astype(data.dtype)
+        else:
+            result = data / normalization
     elif isinstance(data, csr_array):
         if state.qtype == Qtype.ket:
             rows = (
@@ -337,7 +369,7 @@ def _project(
             kept_rows = rows[keep]
             result = csr_array(
                 (
-                    data.data[keep] / normalization,
+                    _normalize_numpy_vector(data.data[keep], normalization),
                     (kept_rows, np.zeros_like(kept_rows)),
                 ),
                 shape=data.shape,
@@ -347,7 +379,7 @@ def _project(
             kept_cols = data.indices[keep]
             result = csr_array(
                 (
-                    data.data[keep] / normalization,
+                    _normalize_numpy_vector(data.data[keep], normalization),
                     (np.zeros_like(kept_cols), kept_cols),
                 ),
                 shape=data.shape,
@@ -370,8 +402,8 @@ def _project(
             # no full-sized dtype-promotion copy is needed.
             output_dtype = np.float64 if data.dtype.kind in "biu" else data.dtype
             output = np.zeros(data.shape, dtype=output_dtype)
-            output.reshape(-1, dim, stride)[:, outcome, :] = (
-                data.reshape(-1, dim, stride)[:, outcome, :] / normalization
+            output.reshape(-1, dim, stride)[:, outcome, :] = _normalize_numpy_vector(
+                data.reshape(-1, dim, stride)[:, outcome, :], normalization
             )
             result = output
         else:
