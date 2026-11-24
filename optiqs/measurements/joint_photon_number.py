@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     import torch
 
 __all__ = [
+    "apply_photon_number_loss",
     "iter_joint_photon_number_branches",
     "joint_photon_number_branches",
     "joint_photon_number_probabilities",
@@ -151,6 +152,108 @@ def _loss_kernel(dim: int, eta: float) -> np.ndarray:
     if dim * dim * np.dtype(np.float64).itemsize > _MAX_CACHED_LOSS_KERNEL_BYTES:
         return _build_loss_kernel(dim, eta)
     return _cached_loss_kernel(dim, eta)
+
+
+def _loss_axes(ndim: int, axes: Sequence[int] | None) -> tuple[int, ...]:
+    if axes is None:
+        return tuple(range(ndim))
+    if isinstance(axes, (str, bytes)):
+        raise TypeError("axes must be a sequence of integer indices")
+    try:
+        values = tuple(axes)
+    except TypeError as exc:
+        raise TypeError("axes must be a sequence of integer indices") from exc
+    selected: list[int] = []
+    for axis in values:
+        if isinstance(axis, (bool, np.bool_)) or not isinstance(axis, Integral):
+            raise TypeError("each axis must be an integer index")
+        if not -ndim <= axis < ndim:
+            raise IndexError("axis is outside the probability array")
+        normalized_axis = int(axis) % ndim
+        if normalized_axis in selected:
+            raise ValueError("axes must not contain duplicates")
+        selected.append(normalized_axis)
+    return tuple(selected)
+
+
+def _apply_photon_number_loss(
+    probabilities: np.ndarray, eta: float, axes: tuple[int, ...]
+) -> np.ndarray:
+    """Apply loss to validated, normalized float64 probabilities."""
+    if eta == 0.0 or not axes:
+        return probabilities
+    if eta == 1.0:
+        result = np.zeros_like(probabilities)
+        if len(axes) == probabilities.ndim:
+            result[(0,) * probabilities.ndim] = 1.0
+        else:
+            target = tuple(
+                0 if i in axes else slice(None) for i in range(probabilities.ndim)
+            )
+            result[target] = probabilities.sum(axis=axes, dtype=np.float64)
+            result /= result.sum(dtype=np.float64)
+        return result
+
+    # Share each transition matrix across axes of equal Fock dimension.
+    kernels: dict[int, np.ndarray] = {}
+    result = probabilities
+    for axis in axes:
+        dim = result.shape[axis]
+        if dim not in kernels:
+            kernels[dim] = _loss_kernel(dim, eta)
+        result = np.moveaxis(
+            np.tensordot(kernels[dim], result, axes=(1, axis)), 0, axis
+        )
+    # Match the existing joint PNRD normalization convention.
+    result /= result.sum(dtype=np.float64)
+    return result
+
+
+def apply_photon_number_loss(
+    probabilities: np.ndarray,
+    eta: float,
+    *,
+    axes: Sequence[int] | None = None,
+) -> np.ndarray:
+    """Apply independent photon loss to a single normalized Fock distribution.
+
+    Each selected axis is indexed by incident photon number. ``eta`` is the
+    loss probability, not transmissivity: 0 is ideal and 1 is complete loss.
+    ``axes=None`` selects all axes; negative indices are supported and an
+    empty sequence selects none. Duplicate or out-of-range axes are invalid.
+
+    The input must be a nonempty real integer or floating-point ndarray with
+    finite nonnegative entries and total probability 1 (absolute tolerance
+    1e-7). Unselected axes are retained, not independently normalized batch
+    elements. Returns a float64 array of the same shape; never modifies or
+    aliases the input. Zero loss or empty axes return an unchanged copy.
+    For nontrivial loss, normalize the output to remove rounding error.
+
+    This is a classical number-probability transform, not a quantum channel
+    on amplitudes or density matrices. Independently normalized batches
+    are outside the scope of this API version.
+    """
+    eta = _loss_probability(eta)
+    if not isinstance(probabilities, np.ndarray):
+        raise TypeError("probabilities must be a numpy ndarray")
+    if probabilities.ndim == 0 or probabilities.size == 0:
+        raise ValueError(
+            "probabilities must be a nonempty array with at least one axis"
+        )
+    if probabilities.dtype.kind not in "iuf":
+        raise TypeError("probabilities must have a real integer or floating dtype")
+    selected = _loss_axes(probabilities.ndim, axes)
+    # Validate before conversion so tiny negative values cannot underflow to zero.
+    if not np.isfinite(probabilities).all() or np.any(probabilities < 0):
+        raise ValueError("probabilities must be finite and nonnegative")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        values = np.asarray(probabilities, dtype=np.float64)
+        total = values.sum(dtype=np.float64)
+    if not np.isclose(total, 1.0, rtol=0.0, atol=1e-7):
+        raise ValueError("probabilities must sum to 1")
+    if eta == 0.0 or not selected:
+        return values.copy()
+    return _apply_photon_number_loss(values, eta, selected)
 
 
 def _loss_parent_weights(
@@ -694,27 +797,7 @@ def joint_photon_number_probabilities(
         if isinstance(state, LowRankDensity)
         else _normalized_joint_weights(state, dims, selected)[0]
     )
-    if eta == 0.0:
-        return normalized
-    if eta == 1.0:
-        result = np.zeros_like(normalized)
-        result[(0,) * len(selected)] = 1.0
-        return result
-
-    # Only the joint-number tensor and small per-mode transition matrices
-    # are needed. No D x D state or multi-mode Kraus operators are formed.
-    kernels: dict[int, np.ndarray] = {}
-    for axis, mode in enumerate(selected):
-        dim = dims[mode]
-        if dim not in kernels:
-            kernels[dim] = _loss_kernel(dim, eta)
-        normalized = np.moveaxis(
-            np.tensordot(kernels[dim], normalized, axes=(1, axis)), 0, axis
-        )
-    # Compensate for the last rounding error in column sums of binomial
-    # matrices, especially for high Fock cutoffs.
-    normalized /= normalized.sum(dtype=np.float64)
-    return normalized
+    return _apply_photon_number_loss(normalized, eta, tuple(range(len(selected))))
 
 
 joint_pnrd = joint_photon_number_probabilities

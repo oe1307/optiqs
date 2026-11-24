@@ -19,6 +19,7 @@ from optiqs.core import (
 )
 from optiqs.measurements import (
     HomodyneBasisCache,
+    apply_photon_number_loss,
     homodyne_probabilities,
     homodyne_probabilities_angles,
     iter_joint_photon_number_branches,
@@ -79,6 +80,7 @@ __all__ = [
     "annihilation",
     "apply_local",
     "apply_local_sequence",
+    "apply_photon_number_loss",
     "beam_splitter",
     "bs",
     "cat",
