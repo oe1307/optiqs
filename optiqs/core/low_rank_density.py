@@ -121,6 +121,9 @@ class LowRankDensity:
         if imag is not None:
             scale = np.maximum(scale, np.max(np.abs(imag), initial=0))
 
+        if not np.isfinite(scale) or scale == 0:
+            raise ValueError("state must have finite amplitudes and nonzero norm")
+
         # Divide real components directly: a reciprocal of a subnormal
         # scale can overflow (including in sparse or complex division).
         real /= scale
@@ -129,6 +132,15 @@ class LowRankDensity:
         # At least one component has magnitude one. The scaled norm is
         # safe to compute, and the original norm need not be representable.
         values /= np.linalg.norm(values)
+        if isinstance(ket, sparse.csr_array):
+            # Qobj prunes CSR entries below tol. Normalize the survivors.
+            ket.data[np.abs(ket.data) < state._tol] = 0
+            ket.eliminate_zeros()
+            norm = np.linalg.norm(ket.data)
+            if norm == 0:
+                raise ValueError("state has zero norm after tolerance pruning")
+            ket.data /= norm
+
         return cls(ket, dims, tol=state._tol)
 
     @property
