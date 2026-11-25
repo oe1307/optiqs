@@ -101,14 +101,35 @@ class LowRankDensity:
                 if state.qtype == Qtype.ket
                 else sparse.csr_array(cast(Any, data.conj().T))
             )
-            values = ket.data
         else:
             ket = data if state.qtype == Qtype.ket else data.conj().T
-            values = ket
-        norm = float(np.linalg.norm(values))
-        if not math.isfinite(norm) or norm == 0:
-            raise ValueError("state must have a finite positive norm")
-        return cls(ket / norm, dims, tol=state._tol)
+
+        # Work on a copy and promote real/integer inputs before taking abs.
+        # For CSR, scale only the stored amplitudes, without densifying.
+        dtype = np.result_type(
+            ket.dtype, np.complex64 if np.iscomplexobj(ket) else np.float64
+        )
+        ket = ket.astype(dtype, copy=True)
+        values = ket.data if isinstance(ket, sparse.csr_array) else ket
+
+        # Even abs(z) can overflow for finite complex z near the dtype limit.
+        # Scale by the largest real or imaginary component instead.
+        # np.real/imag return writable views of these NumPy arrays.
+        real = np.real(values)
+        imag = np.imag(values) if np.iscomplexobj(values) else None
+        scale = np.max(np.abs(real), initial=0)
+        if imag is not None:
+            scale = np.maximum(scale, np.max(np.abs(imag), initial=0))
+
+        # Divide real components directly: a reciprocal of a subnormal
+        # scale can overflow (including in sparse or complex division).
+        real /= scale
+        if imag is not None:
+            imag /= scale
+        # At least one component has magnitude one. The scaled norm is
+        # safe to compute, and the original norm need not be representable.
+        values /= np.linalg.norm(values)
+        return cls(ket, dims, tol=state._tol)
 
     @property
     def dims(self) -> tuple[int, ...]:
