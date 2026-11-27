@@ -4,6 +4,12 @@ from scipy.sparse import csr_array
 from scipy.special import gammaln
 
 from optiqs.core.q_obj import Qobj
+from optiqs.states._validation import (
+    validate_alpha,
+    validate_dim,
+    validate_integer,
+    validate_tol,
+)
 
 
 def rotational_cat(
@@ -53,8 +59,12 @@ def rotational_cat(
 
     Raises
     ------
+    TypeError
+        If dim, order, or sector is not an integer, alpha is not a real
+        or complex number, or tol is not a real number.
+        Booleans are not numeric inputs.
     ValueError
-        For invalid parameters, no Fock basis vector in the requested
+        For invalid parameter values, no Fock basis vector in the requested
         sector, or alpha == 0 with sector != 0 (the unnormalized
         superposition vanishes at alpha == 0).
 
@@ -75,24 +85,17 @@ def rotational_cat(
     the commonly used logical pair is obtained using order=2*N and
     sectors 0 and N, respectively.
     """
-    for name, value in (("dim", dim), ("order", order), ("sector", sector)):
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer)
-        ):
-            raise TypeError(f"{name} must be an integer")
-
-    if dim < 1:
-        raise ValueError("dim must be positive")
+    dim = validate_dim(dim)
+    order = validate_integer("order", order)
+    sector = validate_integer("sector", sector)
     if order < 1:
         raise ValueError("order must be at least 1")
     if not 0 <= sector < order:
         raise ValueError("sector must satisfy 0 <= sector < order")
     if sector >= dim:
         raise ValueError("dim is too small for the requested sector")
-    if not 0 <= tol < 1:
-        raise ValueError("tol must satisfy 0 <= tol < 1")
-    if not np.isfinite(alpha):
-        raise ValueError("alpha must be finite")
+    validate_tol(tol)
+    validate_alpha(alpha)
     if alpha == 0 and sector != 0:
         raise ValueError("Nonzero rotation sectors are undefined at alpha=0")
 
