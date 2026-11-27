@@ -437,11 +437,7 @@ def _safe_torch_amplitudes(amplitudes: torch.Tensor) -> torch.Tensor:
 
 
 def _numpy_vector_weights(values: np.ndarray) -> np.ndarray:
-    """Compute complex64 Born weights without losing subnormal components."""
-    if values.dtype == np.complex64:
-        # np.abs(complex64) itself rounds to float32. Compute the magnitude
-        # from complex128 instead, before the stable float64 squaring step.
-        values = values.astype(np.complex128)
+    """Compute Born weights using the shared float64 amplitude kernel."""
     return _squared_magnitudes_numpy(values)
 
 
