@@ -23,9 +23,10 @@ def make_state(amplitudes, use_sparse, qtype, tol=0):
 ])
 def test_invalid_amplitudes(use_sparse, qtype, amplitudes):
     state = make_state(amplitudes, use_sparse, qtype)
-    with np.errstate(divide="raise", invalid="raise", over="raise"):
-        with pytest.raises(ValueError):
-            LowRankDensity.from_ket(state)
+    with np.errstate(divide="raise", invalid="raise", over="raise"), pytest.raises(
+        ValueError
+    ):
+        LowRankDensity.from_ket(state)
 
 
 @pytest.mark.parametrize("use_sparse", [False, True])

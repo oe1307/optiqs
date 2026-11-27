@@ -46,7 +46,7 @@ def _geometry(state: Qobj, mode: int) -> tuple[int, int]:
     return dims[mode], prod(dims[next_mode:])
 
 
-def _squared_magnitudes_numpy(values: np.ndarray) -> np.ndarray:
+def _squared_magnitudes_numpy(values: npt.NDArray[np.generic]) -> np.ndarray:
     """Squared amplitudes in float64 without low-precision intermediates."""
     if values.dtype.kind == "c":
         if values.dtype.itemsize < 16:
