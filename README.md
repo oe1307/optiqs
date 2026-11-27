@@ -43,3 +43,20 @@ probabilities = opt.pnrd(state)
 for n, probability in enumerate(probabilities[:5]):
     print(f"P({n}) = {probability:.3f}")
 ```
+
+### Rotation-symmetric binomial codewords
+
+Use the binomial degree `K` from the code definition directly, independently
+of the rotation symmetry order `N`:
+
+```python
+N, K = 3, 10
+dim = N * K + 1
+logical_0 = opt.rs_binomial(dim, order=N, degree=K)
+logical_1 = opt.rs_binomial(dim, order=N, degree=K, sector=N)
+```
+
+The highest occupied Fock level is `N * K` for these two codewords.
+The existing `cutoff` argument remains an inclusive maximum photon number,
+not the degree: `opt.rs_binomial(dim, cutoff=N * K, order=N)` is equivalent
+for sector 0. Specify only one of `cutoff` and `degree`.
