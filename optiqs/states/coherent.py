@@ -4,6 +4,7 @@ from scipy.sparse import csr_array
 from scipy.special import gammaln
 
 from optiqs.core.q_obj import Qobj
+from optiqs.states._validation import validate_alpha, validate_dim, validate_tol
 
 
 def coherent(
@@ -28,7 +29,7 @@ def coherent(
     dim : int
         Truncation dimension of the Fock Hilbert space.
     alpha : complex
-        Coherent-state amplitude.
+        Coherent-state amplitude (must be finite).
     dtype : dtype, optional
         Data type of the state coefficients.
         Default is numpy.complex128.
@@ -36,7 +37,7 @@ def coherent(
         Absolute threshold for removing small coefficients from
         the sparse representation. Coefficients with magnitudes
         smaller than tol are discarded.
-        Default is 1e-17.
+        Must satisfy 0 <= tol < 1. Default is 1e-17.
 
     Returns
     -------
@@ -45,8 +46,11 @@ def coherent(
 
     Raises
     ------
+    TypeError
+        If dim is not an integer, alpha is not a real or complex number,
+        or tol is not a real number. Booleans are not numeric inputs.
     ValueError
-        If dim is not positive.
+        If dim is not positive, alpha is not finite, or tol is invalid.
 
     Notes
     -----
@@ -61,11 +65,9 @@ def coherent(
     matrix exponential required by displacement-operator
     based constructions.
     """
-    if not 0 <= tol < 1:
-        raise ValueError("tol must satisfy 0 <= tol < 1")
-
-    if dim < 1:
-        raise ValueError("dim must be positive")
+    dim = validate_dim(dim)
+    validate_tol(tol)
+    validate_alpha(alpha)
 
     n = np.arange(dim)
 

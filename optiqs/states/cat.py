@@ -4,6 +4,7 @@ from scipy.sparse import csr_array
 from scipy.special import gammaln
 
 from optiqs.core.q_obj import Qobj
+from optiqs.states._validation import validate_alpha, validate_dim, validate_tol
 
 
 def cat(
@@ -29,7 +30,7 @@ def cat(
     dim : int
         Truncation dimension of the Fock Hilbert space.
     alpha : complex
-        Coherent-state amplitude.
+        Coherent-state amplitude (must be finite).
     odd : bool, optional
         If True, construct an odd cat state.
         If False, construct an even cat state.
@@ -41,7 +42,7 @@ def cat(
         Absolute threshold for removing small coefficients from
         the sparse representation. Coefficients with magnitudes
         smaller than tol are discarded.
-        Default is 1e-17.
+        Must satisfy 0 <= tol < 1. Default is 1e-17.
 
     Returns
     -------
@@ -50,10 +51,14 @@ def cat(
 
     Raises
     ------
+    TypeError
+        If dim is not an integer, alpha is not a real or complex number,
+        odd is not a boolean, or tol is not a real number.
+        Booleans are not numeric inputs.
     ValueError
-        If dim is not positive, the odd cat state is requested
-        with alpha=0, or the truncated Hilbert space does not
-        contain any Fock states of the requested parity.
+        If dim is not positive, alpha is not finite, tol is invalid,
+        the odd cat state is requested with alpha=0, or the truncated
+        Hilbert space does not contain any Fock states of the requested parity.
 
     Notes
     -----
@@ -68,11 +73,11 @@ def cat(
     matrix exponential required by displacement-operator
     based constructions.
     """
-    if not 0 <= tol < 1:
-        raise ValueError("tol must satisfy 0 <= tol < 1")
-
-    if dim < 1:
-        raise ValueError("dim must be positive")
+    dim = validate_dim(dim)
+    if not isinstance(odd, (bool, np.bool_)):
+        raise TypeError("odd must be a boolean")
+    validate_tol(tol)
+    validate_alpha(alpha)
     if odd and alpha == 0:
         raise ValueError("Odd cat is undefined at alpha=0")
 
@@ -80,6 +85,7 @@ def cat(
     if n.size == 0:
         raise ValueError("dim is too small for the requested parity")
     if alpha == 0:
+        n = n[:1]
         coeff = np.array([1.0 + 0j])
     else:
         log_amp = n * np.log(abs(alpha)) - 0.5 * gammaln(n + 1)

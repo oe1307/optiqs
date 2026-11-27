@@ -5,6 +5,12 @@ from numpy.typing import DTypeLike
 from scipy.sparse import csr_array
 
 from optiqs.core.q_obj import Qobj
+from optiqs.states._validation import (
+    validate_dim,
+    validate_integer,
+    validate_real,
+    validate_tol,
+)
 
 
 def gkp(
@@ -35,17 +41,18 @@ def gkp(
         Width of the Gaussian peaks in position space.
         Must satisfy 0 < delta <= 1. Default is 0.3.
     kappa : float or None, optional
-        Inverse width of the Gaussian envelope.
+        Inverse width of the Gaussian envelope (finite and positive).
         If None, kappa is set to delta.
     cutoff : int, optional
         Number of positive peak pairs included in the
-        Gaussian superposition. Default is 4.
+        Gaussian superposition (positive integer). Default is 4.
     dtype : dtype, optional
         Data type of the state coefficients.
         Default is numpy.complex128.
     tol : float, optional
         Absolute threshold for removing small coefficients
-        from the sparse representation. Default is 1e-17.
+        from the sparse representation. Must satisfy 0 <= tol < 1.
+        Default is 1e-17.
 
     Returns
     -------
@@ -55,9 +62,14 @@ def gkp(
 
     Raises
     ------
+    TypeError
+        If dim, logical, or cutoff is not an integer, or delta, kappa
+        (when not None), or tol is not a real number.
+        Booleans are not numeric inputs.
     ValueError
-        If dim, logical, delta, kappa, or cutoff is invalid,
-        or the state cannot be normalized numerically.
+        If dim, logical, delta, kappa, cutoff, or tol has an invalid value,
+        the state cannot be normalized numerically, or all coefficients
+        are removed by tol.
 
     Notes
     -----
@@ -71,19 +83,23 @@ def gkp(
     The computational complexity is O(dim * cutoff).
     No matrix exponentiation or dense operators are required.
     """
-    if dim < 1:
-        raise ValueError("dim must be positive")
+    dim = validate_dim(dim)
+    logical = validate_integer("logical", logical)
+    cutoff = validate_integer("cutoff", cutoff)
     if logical not in (0, 1):
         raise ValueError("logical must be 0 or 1")
-    if not np.isfinite(delta) or not 0 < delta <= 1:
+    validate_real("delta", delta)
+    if not 0 < delta <= 1:
         raise ValueError("delta must satisfy 0 < delta <= 1")
 
     if kappa is None:
         kappa = delta
-    if not np.isfinite(kappa) or kappa <= 0:
+    validate_real("kappa", kappa)
+    if kappa <= 0:
         raise ValueError("kappa must be finite and positive")
     if cutoff < 1:
         raise ValueError("cutoff must be positive")
+    validate_tol(tol)
 
     # Non-negative lattice positions
     m = np.arange(logical, 2 * cutoff + 1, 2)
