@@ -18,35 +18,26 @@ def rotational_binomial(
 ) -> Qobj:
     """Construct a normalized rotation-symmetric binomial codeword.
 
-    ``order=N`` specifies an N-fold rotation symmetry with angle ``2*pi/N``
-    (180, 120, and 90 degrees for N=2, 3, 4). The codeword uses Fock
-    levels ``r + k*N`` for ``k=0, ..., K``, with coefficients
+    For cutoff K, rotation order N, and remainder r = sector % N,
+    the Fock levels r + k*N (k = 0, ..., K) have coefficients
 
         sqrt(comb(K, k) / 2**K) * (-1)**(logical*k),
 
-    where ``r = sector % order``, ``logical = (sector // order) % 2``,
-    and ``K = floor((cutoff - r) / order)``. In particular,
-    ``sector=0`` generates the all-positive state and ``sector=order``
-    generates the alternating-sign state. They are orthogonal for K >= 1.
-    Both have N-fold rotational symmetry; a rotation by ``pi/N``
-    interchanges them (up to a global phase).
+    where logical = (sector // N) % 2. Sector 0 and sector N
+    give the two logical codewords, orthogonal for K >= 1.
 
     Parameters
     ----------
     dim : int
-        Fock-space simulation dimension. Photon numbers from 0 to
-        ``dim - 1`` are representable; ``dim`` must exceed ``cutoff``.
+        Fock-space dimension, greater than r + K*N.
     cutoff : int
-        Maximum allowed photon number (inclusive). A nontrivial logical
-        pair with ``sector=0`` and ``sector=order`` requires
-        ``cutoff >= order``.
+        Binomial cutoff K (nonnegative), not the maximum photon number.
+        K >= 1 is required for an orthogonal logical pair.
     order : int
-        Positive rotation-symmetry order N. The angular period is
-        ``360 / order`` degrees when K >= 1 and both parities occur.
+        Positive rotation-symmetry order N.
     sector : int, optional
-        Selects the Fock-number remainder ``r = sector % order`` and
-        the logical phase ``(sector // order) % 2``. Must satisfy
-        ``0 <= sector <= cutoff``. Default is 0.
+        Nonnegative integer selecting the Fock-number remainder and
+        logical phase. Default is 0.
     dtype : DTypeLike, optional
         Coefficient data type (default: numpy.complex128).
     tol : float, optional
@@ -56,18 +47,16 @@ def rotational_binomial(
     Returns
     -------
     Qobj
-        Normalized single-mode ket, stored as a CSR sparse column vector.
+        Single-mode ket, normalized before sparsity pruning.
 
     Notes
     -----
-    Logarithmic binomial coefficients avoid factorial overflow. Each
-    codeword is normalized before sparsity pruning; large ``tol`` values
-    may reduce its final norm. For ``K=0``, a single Fock state is returned
-    (its rotation symmetry is not uniquely N-fold).
+    Logarithmic binomial coefficients avoid factorial overflow.
+    For K=0, the state is a single Fock state.
 
-    For ``order=2, cutoff=4``, ``sector=0`` generates
-    ``(|0> + sqrt(2)|2> + |4>)/2``, while ``sector=2`` generates
-    ``(|0> - sqrt(2)|2> + |4>)/2``.
+    For order=2 and cutoff=2, sector=0 gives
+    (|0> + sqrt(2)|2> + |4>)/2, while sector=2 gives
+    (|0> - sqrt(2)|2> + |4>)/2.
     """
     for name, value in (
         ("dim", dim),
@@ -80,31 +69,30 @@ def rotational_binomial(
         ):
             raise TypeError(f"{name} must be an integer")
 
+    dim, cutoff, order, sector = map(int, (dim, cutoff, order, sector))
     if dim < 1:
         raise ValueError("dim must be positive")
     if cutoff < 0:
         raise ValueError("cutoff must be nonnegative")
     if order < 1:
         raise ValueError("order must be at least 1")
-    if not 0 <= sector <= cutoff:
-        raise ValueError("sector must satisfy 0 <= sector <= cutoff")
-    if cutoff >= dim:
-        raise ValueError("dim must be at least cutoff + 1")
+    if sector < 0:
+        raise ValueError("sector must be nonnegative")
     if not np.isfinite(tol) or not 0 <= tol < 1:
         raise ValueError("tol must satisfy 0 <= tol < 1")
 
     logical, remainder = divmod(sector, order)
-    degree = (cutoff - remainder) // order
-    k = np.arange(degree + 1, dtype=np.int64)
+    if remainder + cutoff * order >= dim:
+        raise ValueError("dim must exceed remainder + cutoff * order")
+
+    k = np.arange(cutoff + 1, dtype=np.int64)
     n = remainder + k * order
 
-    log_comb = gammaln(degree + 1) - gammaln(k + 1) - gammaln(degree - k + 1)
-    log_amp = 0.5 * log_comb
-    coeff = np.exp(log_amp - log_amp.max())
+    log_comb = gammaln(cutoff + 1) - gammaln(k + 1) - gammaln(cutoff - k + 1)
+    coeff = np.exp(0.5 * (log_comb - log_comb.max()))
     coeff /= np.linalg.norm(coeff)
 
     if logical % 2:
-        # Alternating signs give the orthogonal logical codeword.
         coeff[1::2] *= -1
 
     data = csr_array((coeff, (n, np.zeros(n.size, dtype=np.int64))), shape=(dim, 1))
